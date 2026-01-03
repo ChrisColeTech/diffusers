@@ -162,6 +162,9 @@ class FP8Linear(nn.Module):
 
 def _should_convert_to_fp8(state_dict, prefix):
     """Check if a module should be converted to FP8Linear based on state_dict."""
+    if state_dict is None:
+        return False
+
     weight_key = prefix + "weight"
     scale_key = prefix + "weight_scale"
 
