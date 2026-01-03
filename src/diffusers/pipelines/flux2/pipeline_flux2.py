@@ -877,6 +877,11 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             text_encoder_out_layers=text_encoder_out_layers,
         )
 
+        # Move prompt embeddings to transformer device (for multi-GPU setups)
+        transformer_device = next(self.transformer.parameters()).device
+        prompt_embeds = prompt_embeds.to(transformer_device)
+        text_ids = text_ids.to(transformer_device)
+
         # 4. process images
         if image is not None and not isinstance(image, list):
             image = [image]
@@ -904,7 +909,7 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
-        # 5. prepare latent variables
+        # 5. prepare latent variables - use transformer device for multi-GPU setups
         num_channels_latents = self.transformer.config.in_channels // 4
         latents, latent_ids = self.prepare_latents(
             batch_size=batch_size * num_images_per_prompt,
@@ -912,7 +917,7 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             height=height,
             width=width,
             dtype=prompt_embeds.dtype,
-            device=device,
+            device=transformer_device,
             generator=generator,
             latents=latents,
         )
@@ -924,11 +929,11 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 images=condition_images,
                 batch_size=batch_size * num_images_per_prompt,
                 generator=generator,
-                device=device,
+                device=transformer_device,
                 dtype=self.vae.dtype,
             )
 
-        # 6. Prepare timesteps
+        # 6. Prepare timesteps - use transformer device for multi-GPU setups
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
         if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
             sigmas = None
@@ -937,15 +942,15 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
-            device,
+            transformer_device,
             sigmas=sigmas,
             mu=mu,
         )
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
-        # handle guidance
-        guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
+        # handle guidance - use transformer device for multi-GPU setups
+        guidance = torch.full([1], guidance_scale, device=transformer_device, dtype=torch.float32)
         guidance = guidance.expand(latents.shape[0])
 
         # 7. Denoising loop

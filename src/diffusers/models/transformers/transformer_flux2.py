@@ -40,6 +40,65 @@ from ..normalization import AdaLayerNormContinuous
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
+class FP8Linear(nn.Module):
+    """
+    Linear layer that supports FP8 weights with per-tensor scaling.
+
+    Stores weights as FP8 E4M3FN with a scalar weight_scale.
+    During forward, weights are dequantized on-the-fly:
+        output = F.linear(input, weight.to(input.dtype) * weight_scale, bias)
+
+    This preserves FP8 memory savings while producing correct outputs.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Weight stored as FP8
+        self.weight = nn.Parameter(torch.empty((out_features, in_features), device=device, dtype=dtype))
+        # Scale stored as float32
+        self.weight_scale = nn.Parameter(torch.ones(1, device=device, dtype=torch.float32))
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features, device=device, dtype=torch.bfloat16))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Dequantize FP8 weight on-the-fly
+        # Move scale to weight's device if needed (scale stored on CPU to save VRAM)
+        scale = self.weight_scale.to(device=self.weight.device, dtype=x.dtype)
+        weight_dequant = self.weight.to(x.dtype) * scale
+        return F.linear(x, weight_dequant, self.bias)
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear, weight_scale: torch.Tensor) -> "FP8Linear":
+        """Create FP8Linear from existing Linear layer and scale tensor.
+
+        Reuses the existing weight tensor - no new allocation.
+        """
+        # Create without allocating new tensors
+        fp8_linear = object.__new__(cls)
+        nn.Module.__init__(fp8_linear)
+
+        fp8_linear.in_features = linear.in_features
+        fp8_linear.out_features = linear.out_features
+
+        # Reuse existing weight - no copy
+        fp8_linear.weight = linear.weight
+        # Add scale on CPU to save GPU memory
+        fp8_linear.weight_scale = nn.Parameter(weight_scale.to("cpu"))
+
+        if linear.bias is not None:
+            fp8_linear.bias = linear.bias
+        else:
+            fp8_linear.register_parameter('bias', None)
+
+        return fp8_linear
+
+
 def _get_projections(attn: "Flux2Attention", hidden_states, encoder_hidden_states=None):
     query = attn.to_q(hidden_states)
     key = attn.to_k(hidden_states)
@@ -825,6 +884,8 @@ class Flux2Transformer2DModel(
 
         # 2. Input projection for image (hidden_states) and conditioning text (encoder_hidden_states)
         hidden_states = self.x_embedder(hidden_states)
+        # Cast encoder_hidden_states to model dtype (may come from CPU text encoder as float32)
+        encoder_hidden_states = encoder_hidden_states.to(hidden_states.dtype)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
         # 3. Calculate RoPE embeddings from image and text tokens
@@ -906,3 +967,42 @@ class Flux2Transformer2DModel(
             return (output,)
 
         return Transformer2DModelOutput(sample=output)
+
+    def enable_fp8_mode(self, weight_scales: Dict[str, torch.Tensor]) -> int:
+        """
+        Enable FP8 mode by converting Linear layers to FP8Linear using provided scales.
+
+        Args:
+            weight_scales: Dict mapping parameter names to their weight_scale tensors.
+                           Keys should be like "transformer_blocks.0.attn.to_q.weight_scale"
+
+        Returns:
+            Number of layers converted to FP8.
+        """
+        converted = 0
+
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                # Check if there's a weight_scale for this layer
+                scale_key = f"{name}.weight_scale"
+                if scale_key in weight_scales:
+                    scale = weight_scales[scale_key]
+
+                    # Create FP8Linear replacement
+                    fp8_linear = FP8Linear.from_linear(module, scale)
+
+                    # Replace the module in parent
+                    # Navigate to parent and replace
+                    parts = name.rsplit('.', 1)
+                    if len(parts) == 2:
+                        parent_name, attr_name = parts
+                        parent = self.get_submodule(parent_name)
+                    else:
+                        parent = self
+                        attr_name = name
+
+                    setattr(parent, attr_name, fp8_linear)
+                    converted += 1
+
+        logger.info(f"Converted {converted} Linear layers to FP8Linear")
+        return converted

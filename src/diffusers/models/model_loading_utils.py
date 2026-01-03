@@ -677,7 +677,44 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
             )
 
         weights = torch.from_numpy(tensor.data.copy())
-        parsed_parameters[name] = GGUFParameter(weights, quant_type=quant_type) if is_gguf_quant else weights
+
+        # GGUF stores shapes in row-major (C) order, need to REVERSE for PyTorch
+        # This matches CombinedGGUFLoader behavior
+        raw_shape = tuple(int(d) for d in tensor.shape)
+        if len(raw_shape) == 4:
+            # Heuristic: 4D tensors with large first dim and small last dims
+            # are likely already in PyTorch order [out_ch, in_ch, H, W]
+            if raw_shape[0] > 100 and raw_shape[2] <= 14 and raw_shape[3] <= 14:
+                logical_shape = torch.Size(raw_shape)
+            else:
+                logical_shape = torch.Size(tuple(reversed(raw_shape)))
+        else:
+            logical_shape = torch.Size(tuple(reversed(raw_shape)))
+
+        # Fix scalar tensors stored as [1] shape (e.g., num_batches_tracked)
+        # These should be scalar tensors with shape []
+        if len(logical_shape) == 1 and logical_shape[0] == 1 and "num_batches_tracked" in name:
+            logical_shape = torch.Size([])
+
+        if is_gguf_quant:
+            param = GGUFParameter(weights, quant_type=quant_type)
+            # Store the correct logical shape for dequantization
+            param.tensor_shape = logical_shape
+            parsed_parameters[name] = param
+        else:
+            # For non-quantized F16/F32, reshape to logical shape if element count matches
+            logical_numel = 1
+            for d in logical_shape:
+                logical_numel *= d
+            if weights.numel() == logical_numel:
+                if len(logical_shape) == 0:
+                    # Scalar tensor
+                    parsed_parameters[name] = weights.squeeze()
+                else:
+                    parsed_parameters[name] = weights.reshape(logical_shape)
+            else:
+                # Element count mismatch - keep original shape
+                parsed_parameters[name] = weights
 
     return parsed_parameters
 

@@ -51,6 +51,7 @@ from .single_file_utils import (
     convert_wan_vae_to_diffusers,
     convert_z_image_controlnet_checkpoint_to_diffusers,
     convert_z_image_transformer_checkpoint_to_diffusers,
+    convert_flux2_vae_checkpoint_to_diffusers,
     create_controlnet_diffusers_config_from_ldm,
     create_unet_diffusers_config_from_ldm,
     create_vae_diffusers_config_from_ldm,
@@ -175,6 +176,10 @@ SINGLE_FILE_LOADABLE_CLASSES = {
     },
     "ZImageControlNetModel": {
         "checkpoint_mapping_fn": convert_z_image_controlnet_checkpoint_to_diffusers,
+    },
+    "AutoencoderKLFlux2": {
+        "checkpoint_mapping_fn": convert_flux2_vae_checkpoint_to_diffusers,
+        "default_subfolder": "vae",
     },
 }
 
@@ -317,6 +322,7 @@ class FromOriginalModelMixin:
         device = kwargs.pop("device", None)
         disable_mmap = kwargs.pop("disable_mmap", False)
         device_map = kwargs.pop("device_map", None)
+        user_device_map = device_map  # Preserve user-provided device_map for multi-GPU loading
 
         user_agent = {"diffusers": __version__, "file_type": "single_file", "framework": "pytorch"}
         # In order to ensure popular quantization methods are supported. Can be disable with `disable_telemetry`
@@ -449,6 +455,10 @@ class FromOriginalModelMixin:
             diffusers_format_checkpoint = checkpoint_mapping_fn(
                 config=diffusers_model_config, checkpoint=checkpoint, **checkpoint_mapping_kwargs
             )
+            # Free original checkpoint to reduce peak memory
+            del checkpoint
+            import gc
+            gc.collect()
         else:
             diffusers_format_checkpoint = checkpoint
 
@@ -472,7 +482,11 @@ class FromOriginalModelMixin:
             unexpected_keys = [
                 param_name for param_name in diffusers_format_checkpoint if param_name not in empty_state_dict
             ]
-            device_map = {"": param_device}
+            # Use user-provided device_map for multi-GPU loading, otherwise default to single device
+            if user_device_map is not None:
+                device_map = user_device_map
+            else:
+                device_map = {"": param_device}
             load_model_dict_into_meta(
                 model,
                 diffusers_format_checkpoint,
@@ -499,13 +513,17 @@ class FromOriginalModelMixin:
             hf_quantizer.postprocess_model(model)
             model.hf_quantizer = hf_quantizer
 
-        if torch_dtype is not None and hf_quantizer is None:
+        # Skip model.to(torch_dtype) when user_device_map is used - weights are already on correct devices/dtype
+        if torch_dtype is not None and hf_quantizer is None and user_device_map is None:
             model.to(torch_dtype)
 
         model.eval()
 
-        if device_map is not None:
-            device_map_kwargs = {"device_map": device_map}
-            dispatch_model(model, **device_map_kwargs)
+        # dispatch_model wraps modules to auto-move inputs to correct device during inference
+        # This is required for multi-GPU - without it, inputs won't move to match weight devices
+        if user_device_map is not None:
+            dispatch_model(model, device_map=user_device_map)
+        elif device_map is not None:
+            dispatch_model(model, device_map=device_map)
 
         return model

@@ -161,6 +161,17 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
         )
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
 
+    @property
+    def _execution_device(self):
+        """
+        Return the transformer's device as the execution device.
+        This is important for multi-GPU setups where text_encoder may be on a different GPU.
+        Latents and timesteps should be created on the transformer's device.
+        """
+        if hasattr(self, "transformer") and self.transformer is not None:
+            return next(self.transformer.parameters()).device
+        return super()._execution_device
+
     def encode_prompt(
         self,
         prompt: Union[str, List[str]],
@@ -230,14 +241,23 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
             return_tensors="pt",
         )
 
-        text_input_ids = text_inputs.input_ids.to(device)
-        prompt_masks = text_inputs.attention_mask.to(device).bool()
+        # Get text encoder device (may differ from target device in multi-GPU setup)
+        text_encoder_device = next(self.text_encoder.parameters()).device
+
+        text_input_ids = text_inputs.input_ids.to(text_encoder_device)
+        prompt_masks = text_inputs.attention_mask.to(text_encoder_device).bool()
 
         prompt_embeds = self.text_encoder(
             input_ids=text_input_ids,
             attention_mask=prompt_masks,
             output_hidden_states=True,
         ).hidden_states[-2]
+
+        # Move embeddings to target device (handles multi-GPU where text_encoder is on different device)
+        if prompt_embeds.device != device:
+            prompt_embeds = prompt_embeds.to(device)
+        # Also move masks for indexing
+        prompt_masks = prompt_masks.to(device)
 
         embeddings_list = []
 
@@ -523,6 +543,15 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
 
                 latent_model_input = latent_model_input.unsqueeze(2)
                 latent_model_input_list = list(latent_model_input.unbind(dim=0))
+
+                # Ensure inputs are on the correct device for CPU offload
+                exec_device = self._execution_device
+                timestep_model_input = timestep_model_input.to(exec_device)
+                if isinstance(prompt_embeds_model_input, list):
+                    prompt_embeds_model_input = [x.to(exec_device) for x in prompt_embeds_model_input]
+                else:
+                    prompt_embeds_model_input = prompt_embeds_model_input.to(exec_device)
+                latent_model_input_list = [x.to(exec_device) for x in latent_model_input_list]
 
                 model_out_list = self.transformer(
                     latent_model_input_list, timestep_model_input, prompt_embeds_model_input, return_dict=False

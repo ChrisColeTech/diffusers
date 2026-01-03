@@ -30,10 +30,12 @@ from .single_file_utils import (
     _legacy_load_safety_checker,
     _legacy_load_scheduler,
     create_diffusers_clip_model_from_ldm,
+    create_diffusers_qwen3_model_from_checkpoint,
     create_diffusers_t5_model_from_checkpoint,
     fetch_diffusers_config,
     fetch_original_config,
     is_clip_model_in_single_file,
+    is_qwen3_in_single_file,
     is_t5_in_single_file,
     load_single_file_checkpoint,
 )
@@ -43,6 +45,53 @@ logger = logging.get_logger(__name__)
 
 # Legacy behaviour. `from_single_file` does not load the safety checker unless explicitly provided
 SINGLE_FILE_OPTIONAL_COMPONENTS = ["safety_checker"]
+
+# Component prefixes for combined checkpoint files
+_COMBINED_CHECKPOINT_PREFIXES = {
+    "transformer": "transformer.",
+    "vae": "vae.",
+    "text_encoder": "text_encoder.",
+}
+
+
+def _split_combined_checkpoint_if_needed(checkpoint):
+    """
+    Split a combined checkpoint (with transformer.*, vae.*, text_encoder.* prefixes)
+    into component-specific state dicts with prefixes stripped.
+
+    Returns a dict where each component can be accessed by name, and keys within
+    each component have their prefix stripped.
+    """
+    # Check if this is a combined checkpoint by looking for component prefixes
+    has_transformer = any(k.startswith("transformer.") for k in checkpoint.keys())
+    has_vae = any(k.startswith("vae.") for k in checkpoint.keys())
+    has_text_encoder = any(k.startswith("text_encoder.") for k in checkpoint.keys())
+
+    # If no component prefixes found, return original checkpoint
+    if not (has_transformer or has_vae or has_text_encoder):
+        return checkpoint
+
+    # Split into component-specific dicts with prefixes stripped
+    split_checkpoint = {}
+
+    for key, value in checkpoint.items():
+        matched = False
+        for component, prefix in _COMBINED_CHECKPOINT_PREFIXES.items():
+            if key.startswith(prefix):
+                stripped_key = key[len(prefix):]
+                if component not in split_checkpoint:
+                    split_checkpoint[component] = {}
+                split_checkpoint[component][stripped_key] = value
+                matched = True
+                break
+
+        # Keys without recognized prefixes go to a general dict
+        if not matched:
+            if "_other" not in split_checkpoint:
+                split_checkpoint["_other"] = {}
+            split_checkpoint["_other"][key] = value
+
+    return split_checkpoint
 
 if is_transformers_available():
     import transformers
@@ -64,6 +113,14 @@ def load_single_file_sub_model(
     disable_mmap=False,
     **kwargs,
 ):
+    # Handle split checkpoint format (from combined files with component prefixes)
+    # If checkpoint is a dict with component names as keys, extract the relevant component
+    if isinstance(checkpoint, dict) and name in checkpoint:
+        checkpoint = checkpoint[name]
+    elif isinstance(checkpoint, dict) and "_other" in checkpoint and name not in _COMBINED_CHECKPOINT_PREFIXES:
+        # For components not in the standard prefixes (like scheduler, tokenizer), use _other
+        checkpoint = checkpoint.get("_other", {})
+
     if is_pipeline_module:
         pipeline_module = getattr(pipelines, library_name)
         class_obj = getattr(pipeline_module, class_name)
@@ -125,6 +182,16 @@ def load_single_file_sub_model(
 
     elif is_transformers_model and is_t5_in_single_file(checkpoint):
         loaded_sub_model = create_diffusers_t5_model_from_checkpoint(
+            class_obj,
+            checkpoint=checkpoint,
+            config=cached_model_config_path,
+            subfolder=name,
+            torch_dtype=torch_dtype,
+            local_files_only=local_files_only,
+        )
+
+    elif is_transformers_model and is_qwen3_in_single_file(checkpoint):
+        loaded_sub_model = create_diffusers_qwen3_model_from_checkpoint(
             class_obj,
             checkpoint=checkpoint,
             config=cached_model_config_path,
@@ -398,6 +465,10 @@ class FromSingleFileMixin:
             revision=revision,
             disable_mmap=disable_mmap,
         )
+
+        # For combined GGUF/safetensors files with component prefixes (transformer.*, vae.*, text_encoder.*),
+        # split the checkpoint into component-specific state dicts and strip prefixes
+        checkpoint = _split_combined_checkpoint_if_needed(checkpoint)
 
         if config is None:
             config = fetch_diffusers_config(checkpoint)

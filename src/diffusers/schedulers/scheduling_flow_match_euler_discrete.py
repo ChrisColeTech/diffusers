@@ -453,6 +453,14 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             next_sigma = sigma_next
             dt = sigma_next - sigma
 
+        # Ensure all tensors are on the same device (fixes multi-GPU / CPU offload)
+        # Use model_output's device as the target since it comes from GPU computation
+        target_device = model_output.device
+        sample = sample.to(device=target_device)
+        dt = dt.to(device=target_device, dtype=sample.dtype)
+        current_sigma = current_sigma.to(device=target_device, dtype=sample.dtype)
+        next_sigma = next_sigma.to(device=target_device, dtype=sample.dtype)
+
         if self.config.stochastic_sampling:
             x0 = sample - current_sigma * model_output
             noise = torch.randn_like(sample)

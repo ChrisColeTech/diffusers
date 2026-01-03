@@ -257,15 +257,23 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
             images=image,
             padding=True,
             return_tensors="pt",
-        ).to(device)
-
-        outputs = self.text_encoder(
-            input_ids=model_inputs.input_ids,
-            attention_mask=model_inputs.attention_mask,
-            pixel_values=model_inputs.pixel_values,
-            image_grid_thw=model_inputs.image_grid_thw,
-            output_hidden_states=True,
         )
+
+        # Move inputs to text_encoder's device (may be different from execution device in multi-GPU)
+        text_encoder_device = next(self.text_encoder.parameters()).device
+        model_inputs = model_inputs.to(text_encoder_device)
+
+        # Build text_encoder kwargs - only include pixel_values/image_grid_thw if image was provided
+        encoder_kwargs = {
+            "input_ids": model_inputs.input_ids,
+            "attention_mask": model_inputs.attention_mask,
+            "output_hidden_states": True,
+        }
+        if image is not None:
+            encoder_kwargs["pixel_values"] = model_inputs.pixel_values
+            encoder_kwargs["image_grid_thw"] = model_inputs.image_grid_thw
+
+        outputs = self.text_encoder(**encoder_kwargs)
 
         hidden_states = outputs.hidden_states[-1]
         split_hidden_states = self._extract_masked_hidden(hidden_states, model_inputs.attention_mask)
@@ -280,6 +288,7 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
         )
 
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+        encoder_attention_mask = encoder_attention_mask.to(device=device)
 
         return prompt_embeds, encoder_attention_mask
 
@@ -409,6 +418,10 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
 
     # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit.QwenImageEditPipeline._encode_vae_image
     def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
+        # Move image to VAE's device for multi-GPU support
+        vae_device = next(self.vae.parameters()).device
+        image = image.to(vae_device)
+
         if isinstance(generator, list):
             image_latents = [
                 retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i], sample_mode="argmax")
@@ -627,10 +640,16 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
             [`~pipelines.qwenimage.QwenImagePipelineOutput`] if `return_dict` is True, otherwise a `tuple`. When
             returning a tuple, the first element is a list with the generated images.
         """
-        image_size = image[-1].size if isinstance(image, list) else image.size
-        calculated_width, calculated_height = calculate_dimensions(1024 * 1024, image_size[0] / image_size[1])
-        height = height or calculated_height
-        width = width or calculated_width
+        # Handle text-to-image (no input image) vs image editing
+        if image is not None:
+            image_size = image[-1].size if isinstance(image, list) else image.size
+            calculated_width, calculated_height = calculate_dimensions(1024 * 1024, image_size[0] / image_size[1])
+            height = height or calculated_height
+            width = width or calculated_width
+        else:
+            # Text-to-image mode: use provided dimensions or defaults
+            height = height or 1024
+            width = width or 1024
 
         multiple_of = self.vae_scale_factor * 2
         width = width // multiple_of * multiple_of
@@ -665,6 +684,12 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
 
         device = self._execution_device
         # 3. Preprocess image
+        # Initialize variables for text-to-image mode (no input image)
+        condition_images = None
+        vae_images = None
+        condition_image_sizes = None
+        vae_image_sizes = None
+
         if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
             if not isinstance(image, list):
                 image = [image]
@@ -730,13 +755,17 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
             generator,
             latents,
         )
+        # Build img_shapes - vae_image_sizes may be None for text-to-image
+        vae_shapes = []
+        if vae_image_sizes is not None:
+            vae_shapes = [
+                (1, vae_height // self.vae_scale_factor // 2, vae_width // self.vae_scale_factor // 2)
+                for vae_width, vae_height in vae_image_sizes
+            ]
         img_shapes = [
             [
                 (1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2),
-                *[
-                    (1, vae_height // self.vae_scale_factor // 2, vae_width // self.vae_scale_factor // 2)
-                    for vae_width, vae_height in vae_image_sizes
-                ],
+                *vae_shapes,
             ]
         ] * batch_size
 
@@ -782,6 +811,21 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
             negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
         )
 
+        # Move all tensors to transformer's device for multi-GPU support
+        transformer_device = next(self.transformer.parameters()).device
+        prompt_embeds = prompt_embeds.to(transformer_device)
+        if prompt_embeds_mask is not None:
+            prompt_embeds_mask = prompt_embeds_mask.to(transformer_device)
+        if negative_prompt_embeds is not None:
+            negative_prompt_embeds = negative_prompt_embeds.to(transformer_device)
+        if negative_prompt_embeds_mask is not None:
+            negative_prompt_embeds_mask = negative_prompt_embeds_mask.to(transformer_device)
+        if guidance is not None:
+            guidance = guidance.to(transformer_device)
+        latents = latents.to(transformer_device)
+        if image_latents is not None:
+            image_latents = image_latents.to(transformer_device)
+
         # 6. Denoising loop
         self.scheduler.set_begin_index(0)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -796,7 +840,7 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
                     latent_model_input = torch.cat([latents, image_latents], dim=1)
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                timestep = t.expand(latents.shape[0]).to(latents.dtype).to(latents.device)
                 with self.transformer.cache_context("cond"):
                     noise_pred = self.transformer(
                         hidden_states=latent_model_input,

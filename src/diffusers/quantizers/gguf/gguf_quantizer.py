@@ -73,19 +73,33 @@ class GGUFQuantizer(DiffusersQuantizer):
         return torch_dtype
 
     def check_quantized_param_shape(self, param_name, current_param, loaded_param):
-        loaded_param_shape = loaded_param.shape
         current_param_shape = current_param.shape
         quant_type = loaded_param.quant_type
 
-        block_size, type_size = GGML_QUANT_SIZES[quant_type]
+        # Use stored tensor_shape if available (from CombinedGGUFLoader),
+        # otherwise compute from byte shape
+        if hasattr(loaded_param, 'tensor_shape') and loaded_param.tensor_shape is not None:
+            inferred_shape = loaded_param.tensor_shape
+        else:
+            loaded_param_shape = loaded_param.shape
+            block_size, type_size = GGML_QUANT_SIZES[quant_type]
+            inferred_shape = _quant_shape_from_byte_shape(loaded_param_shape, type_size, block_size)
 
-        inferred_shape = _quant_shape_from_byte_shape(loaded_param_shape, type_size, block_size)
-        if inferred_shape != current_param_shape:
-            raise ValueError(
-                f"{param_name} has an expected quantized shape of: {inferred_shape}, but received shape: {loaded_param_shape}"
-            )
+        # Check direct match
+        if inferred_shape == current_param_shape:
+            return True
 
-        return True
+        # Check transposed match (GGML vs PyTorch convention)
+        # Applies to both Linear [in,out] vs [out,in] and Embedding [embed,vocab] vs [vocab,embed]
+        if len(inferred_shape) == 2:
+            transposed_shape = torch.Size((inferred_shape[1], inferred_shape[0]))
+            if transposed_shape == current_param_shape:
+                loaded_param.needs_transpose = True
+                return True
+
+        raise ValueError(
+            f"{param_name} has an expected quantized shape of: {inferred_shape}, but received shape: {current_param_shape}"
+        )
 
     def check_if_quantized_param(
         self,
@@ -113,6 +127,14 @@ class GGUFQuantizer(DiffusersQuantizer):
         module, tensor_name = get_module_from_name(model, param_name)
         if tensor_name not in module._parameters and tensor_name not in module._buffers:
             raise ValueError(f"{module} does not have a parameter or a buffer named {tensor_name}.")
+
+        # For Embedding layers, dequantize and transpose since they don't use GGUFLinear
+        if isinstance(module, torch.nn.Embedding):
+            from .utils import dequantize_gguf_tensor
+            weight = dequantize_gguf_tensor(param_value)
+            if getattr(param_value, 'needs_transpose', False):
+                weight = weight.T.contiguous()
+            param_value = torch.nn.Parameter(weight.to(self.compute_dtype))
 
         if tensor_name in module._parameters:
             module._parameters[tensor_name] = param_value.to(target_device)

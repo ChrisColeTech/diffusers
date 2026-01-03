@@ -189,6 +189,17 @@ class ZImageImg2ImgPipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingle
         )
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
 
+    @property
+    def _execution_device(self):
+        """
+        Return the transformer's device as the execution device.
+        This is important for multi-GPU setups where text_encoder may be on a different GPU.
+        Latents, timesteps, and images should be created on the transformer/VAE device.
+        """
+        if hasattr(self, "transformer") and self.transformer is not None:
+            return next(self.transformer.parameters()).device
+        return super()._execution_device
+
     # Copied from diffusers.pipelines.z_image.pipeline_z_image.ZImagePipeline.encode_prompt
     def encode_prompt(
         self,
@@ -260,14 +271,22 @@ class ZImageImg2ImgPipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingle
             return_tensors="pt",
         )
 
-        text_input_ids = text_inputs.input_ids.to(device)
-        prompt_masks = text_inputs.attention_mask.to(device).bool()
+        # Get text encoder device (may differ from target device in multi-GPU setup)
+        text_encoder_device = next(self.text_encoder.parameters()).device
+
+        text_input_ids = text_inputs.input_ids.to(text_encoder_device)
+        prompt_masks = text_inputs.attention_mask.to(text_encoder_device).bool()
 
         prompt_embeds = self.text_encoder(
             input_ids=text_input_ids,
             attention_mask=prompt_masks,
             output_hidden_states=True,
         ).hidden_states[-2]
+
+        # Move embeddings to target device (handles multi-GPU where text_encoder is on different device)
+        if prompt_embeds.device != device:
+            prompt_embeds = prompt_embeds.to(device)
+        prompt_masks = prompt_masks.to(device)
 
         embeddings_list = []
 
@@ -590,7 +609,7 @@ class ZImageImg2ImgPipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingle
             num_channels_latents,
             height,
             width,
-            prompt_embeds[0].dtype,
+            self.vae.dtype,  # Use VAE dtype for image encoding (not prompt dtype)
             device,
             generator,
             latents,

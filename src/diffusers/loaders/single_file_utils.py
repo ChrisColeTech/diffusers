@@ -48,6 +48,15 @@ from ..utils.constants import DIFFUSERS_REQUEST_TIMEOUT
 from ..utils.hub_utils import _get_model_file
 from ..utils.torch_utils import empty_device_cache
 
+# GGUF dequantization for text encoder loading
+try:
+    from ..quantizers.gguf.utils import GGUFParameter, dequantize_gguf_tensor
+    _GGUF_AVAILABLE = True
+except ImportError:
+    _GGUF_AVAILABLE = False
+    GGUFParameter = None
+    dequantize_gguf_tensor = None
+
 
 if is_transformers_available():
     from transformers import AutoImageProcessor
@@ -2200,6 +2209,207 @@ def create_diffusers_t5_model_from_checkpoint(
     return model
 
 
+def is_qwen3_in_single_file(checkpoint):
+    """Check if checkpoint contains Qwen3 text encoder weights."""
+    # Check for diffusers-style keys (from combined safetensors)
+    if any(k.startswith("text_encoder.model.layers.") for k in checkpoint.keys()):
+        return True
+    # Check for direct model keys (after prefix stripping)
+    if any(k.startswith("model.layers.") and "self_attn.q_proj" in k for k in checkpoint.keys()):
+        return True
+    return False
+
+
+def convert_qwen3_checkpoint_to_diffusers(checkpoint, torch_dtype=None):
+    """Extract Qwen3 text encoder weights from combined checkpoint.
+
+    Handles:
+    - Prefix stripping: text_encoder.model.* -> model.* -> layers.*
+    - Key renaming: norm_k -> k_norm, norm_q -> q_norm
+    - GGUF dequantization
+    """
+    text_model_dict = {}
+
+    # Key mappings for Qwen3 (checkpoint key -> model key)
+    KEY_RENAMES = {
+        ".self_attn.norm_k.": ".self_attn.k_norm.",
+        ".self_attn.norm_q.": ".self_attn.q_norm.",
+    }
+
+    for key in list(checkpoint.keys()):
+        value = checkpoint[key]
+
+        # Handle text_encoder.* prefix (from combined safetensors/GGUF)
+        if key.startswith("text_encoder."):
+            new_key = key[len("text_encoder."):]
+        # Handle direct model.* keys (after CombinedGGUFLoader strips prefix)
+        elif key.startswith("model."):
+            new_key = key
+        else:
+            continue
+
+        # Strip the "model." prefix to match Qwen3Model's expected keys
+        # Qwen3Model expects "layers.*" not "model.layers.*"
+        if new_key.startswith("model."):
+            new_key = new_key[len("model."):]
+
+        # Apply key renames (norm_k -> k_norm, etc.)
+        for old_pattern, new_pattern in KEY_RENAMES.items():
+            if old_pattern in new_key:
+                new_key = new_key.replace(old_pattern, new_pattern)
+
+        # Dequantize GGUFParameter tensors if GGUF support is available
+        if _GGUF_AVAILABLE and GGUFParameter is not None and isinstance(value, GGUFParameter):
+            value = dequantize_gguf_tensor(value)
+            if torch_dtype is not None:
+                value = value.to(torch_dtype)
+
+        text_model_dict[new_key] = value
+
+    return text_model_dict
+
+
+def create_diffusers_qwen3_model_from_checkpoint(
+    cls,
+    checkpoint,
+    subfolder="",
+    config=None,
+    torch_dtype=None,
+    local_files_only=None,
+):
+    """Create Qwen3Model from checkpoint weights."""
+    if config:
+        config = {"pretrained_model_name_or_path": config}
+    else:
+        config = fetch_diffusers_config(checkpoint)
+
+    model_config = cls.config_class.from_pretrained(**config, subfolder=subfolder, local_files_only=local_files_only)
+    ctx = init_empty_weights if is_accelerate_available() else nullcontext
+    with ctx():
+        model = cls(model_config)
+
+    # Convert checkpoint and dequantize any GGUF tensors
+    diffusers_format_checkpoint = convert_qwen3_checkpoint_to_diffusers(checkpoint, torch_dtype=torch_dtype)
+
+    if is_accelerate_available():
+        load_model_dict_into_meta(model, diffusers_format_checkpoint, dtype=torch_dtype)
+        empty_device_cache()
+    else:
+        model.load_state_dict(diffusers_format_checkpoint, strict=False)
+
+    return model
+
+
+def convert_ministral3_checkpoint_to_diffusers(checkpoint, **kwargs):
+    """Convert GGUF Ministral3/Pixtral keys to transformers format.
+
+    Handles:
+    - blk.N.* -> model.language_model.layers.N.* (text encoder)
+    - v.blk.N.* -> model.vision_tower.transformer.layers.N.* (vision encoder)
+    - mm.* -> model.multi_modal_projector.* (multimodal projector)
+    - token_embd.weight -> model.language_model.embed_tokens.weight
+    - output_norm.weight -> model.language_model.norm.weight
+    """
+    model_dict = {}
+
+    # Text encoder key mapping (blk.N.* -> model.language_model.layers.N.*)
+    text_key_map = {
+        "attn_k.weight": "self_attn.k_proj.weight",
+        "attn_q.weight": "self_attn.q_proj.weight",
+        "attn_v.weight": "self_attn.v_proj.weight",
+        "attn_output.weight": "self_attn.o_proj.weight",
+        "attn_norm.weight": "input_layernorm.weight",
+        "ffn_down.weight": "mlp.down_proj.weight",
+        "ffn_gate.weight": "mlp.gate_proj.weight",
+        "ffn_up.weight": "mlp.up_proj.weight",
+        "ffn_norm.weight": "post_attention_layernorm.weight",
+    }
+
+    # Vision encoder key mapping (v.blk.N.* -> model.vision_tower.transformer.layers.N.*)
+    vision_key_map = {
+        "attn_k.weight": "attention.k_proj.weight",
+        "attn_q.weight": "attention.q_proj.weight",
+        "attn_v.weight": "attention.v_proj.weight",
+        "attn_out.weight": "attention.o_proj.weight",
+        "ln1.weight": "attention_norm.weight",
+        "ln2.weight": "ffn_norm.weight",
+        "ffn_down.weight": "feed_forward.down_proj.weight",
+        "ffn_gate.weight": "feed_forward.gate_proj.weight",
+        "ffn_up.weight": "feed_forward.up_proj.weight",
+    }
+
+    for key in list(checkpoint.keys()):
+        new_key = None
+        value = checkpoint[key]
+
+        # Text encoder layers: blk.N.* -> model.language_model.layers.N.*
+        if key.startswith("blk."):
+            parts = key.split(".")
+            layer_idx = parts[1]
+            remainder = ".".join(parts[2:])
+
+            if remainder in text_key_map:
+                new_key = f"model.language_model.layers.{layer_idx}.{text_key_map[remainder]}"
+
+        # Vision encoder layers: v.blk.N.* -> model.vision_tower.transformer.layers.N.*
+        elif key.startswith("v.blk."):
+            parts = key.split(".")
+            layer_idx = parts[2]  # v.blk.N.* - layer idx is at position 2
+            remainder = ".".join(parts[3:])
+
+            if remainder in vision_key_map:
+                new_key = f"model.vision_tower.transformer.layers.{layer_idx}.{vision_key_map[remainder]}"
+
+        # Text encoder embeddings
+        elif key == "token_embd.weight":
+            new_key = "model.language_model.embed_tokens.weight"
+
+        elif key == "output_norm.weight":
+            new_key = "model.language_model.norm.weight"
+
+        elif key == "output.weight":
+            new_key = "lm_head.weight"
+
+        # Vision encoder embeddings and norms
+        elif key == "v.patch_embd.weight":
+            new_key = "model.vision_tower.patch_conv.weight"
+
+        elif key == "v.patch_embd.bias":
+            new_key = "model.vision_tower.patch_conv.bias"
+
+        elif key == "v.pre_ln.weight":
+            new_key = "model.vision_tower.ln_pre.weight"
+
+        elif key == "v.ln_pre.bias":
+            new_key = "model.vision_tower.ln_pre.bias"
+
+        elif key == "v.token_embd.img_break":
+            new_key = "model.vision_tower.image_break_token"
+
+        # Multimodal projector: mm.* -> model.multi_modal_projector.*
+        elif key.startswith("mm."):
+            mm_parts = key[3:]  # Remove 'mm.' prefix
+            if mm_parts.startswith("1."):
+                new_key = f"model.multi_modal_projector.linear_1.{mm_parts[2:]}"
+            elif mm_parts.startswith("2."):
+                new_key = f"model.multi_modal_projector.linear_2.{mm_parts[2:]}"
+            elif mm_parts.startswith("input_norm."):
+                new_key = f"model.multi_modal_projector.norm.{mm_parts[11:]}"
+            elif mm_parts.startswith("patch_merger."):
+                new_key = f"model.multi_modal_projector.patch_merger.merging_layer.{mm_parts[13:]}"
+
+        # Text projection (for Flux2)
+        elif key == "text_proj.weight":
+            new_key = "text_projection.weight"
+        elif key == "text_proj.bias":
+            new_key = "text_projection.bias"
+
+        if new_key:
+            model_dict[new_key] = value
+
+    return model_dict
+
+
 def convert_animatediff_checkpoint_to_diffusers(checkpoint, **kwargs):
     converted_state_dict = {}
     for k, v in checkpoint.items():
@@ -3724,6 +3934,9 @@ def convert_flux2_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
     }
 
     def convert_flux2_single_stream_blocks(key: str, state_dict: dict[str, object]) -> None:
+        # Skip FP8 scale tensors (they contain .weight but are scalars)
+        if "weight_scale" in key or "scale_weight" in key:
+            return
         # Skip if not a weight, bias, or scale
         if ".weight" not in key and ".bias" not in key and ".scale" not in key:
             return
@@ -3752,6 +3965,9 @@ def convert_flux2_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
         return
 
     def convert_ada_layer_norm_weights(key: str, state_dict: dict[str, object]) -> None:
+        # Skip FP8 scale tensors (they contain .weight but are scalars)
+        if "weight_scale" in key or "scale_weight" in key:
+            return
         # Skip if not a weight
         if ".weight" not in key:
             return
@@ -3770,6 +3986,9 @@ def convert_flux2_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
         return
 
     def convert_flux2_double_stream_blocks(key: str, state_dict: dict[str, object]) -> None:
+        # Skip FP8 scale tensors (they contain .weight but are scalars)
+        if "weight_scale" in key or "scale_weight" in key:
+            return
         # Skip if not a weight, bias, or scale
         if ".weight" not in key and ".bias" not in key and ".scale" not in key:
             return
@@ -3788,15 +4007,22 @@ def convert_flux2_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
             if "qkv" in within_block_name:
                 fused_qkv_weight = state_dict.pop(key)
                 to_q_weight, to_k_weight, to_v_weight = torch.chunk(fused_qkv_weight, 3, dim=0)
+
+                # Update tensor_shape for chunked GGUF tensors (shape is 1/3 of original on dim 0)
+                if hasattr(fused_qkv_weight, 'tensor_shape') and fused_qkv_weight.tensor_shape is not None:
+                    orig_shape = fused_qkv_weight.tensor_shape
+                    chunk_shape = torch.Size([orig_shape[0] // 3] + list(orig_shape[1:]))
+                    for chunk in [to_q_weight, to_k_weight, to_v_weight]:
+                        if hasattr(chunk, 'tensor_shape'):
+                            chunk.tensor_shape = chunk_shape
+
                 if "img" in modality_block_name:
                     # double_blocks.{N}.img_attn.qkv --> transformer_blocks.{N}.attn.{to_q|to_k|to_v}
-                    to_q_weight, to_k_weight, to_v_weight = torch.chunk(fused_qkv_weight, 3, dim=0)
                     new_q_name = "attn.to_q"
                     new_k_name = "attn.to_k"
                     new_v_name = "attn.to_v"
                 elif "txt" in modality_block_name:
                     # double_blocks.{N}.txt_attn.qkv --> transformer_blocks.{N}.attn.{add_q_proj|add_k_proj|add_v_proj}
-                    to_q_weight, to_k_weight, to_v_weight = torch.chunk(fused_qkv_weight, 3, dim=0)
                     new_q_name = "attn.add_q_proj"
                     new_k_name = "attn.add_k_proj"
                     new_v_name = "attn.add_v_proj"
@@ -3909,3 +4135,24 @@ def convert_z_image_controlnet_checkpoint_to_diffusers(checkpoint, config, **kwa
         return converted_state_dict
     else:
         raise ValueError("Unknown Z-Image Turbo ControlNet type.")
+
+
+def convert_flux2_vae_checkpoint_to_diffusers(checkpoint, **kwargs):
+    """
+    Convert Flux2 VAE checkpoint to diffusers format.
+
+    Handles GGUF shape issues where num_batches_tracked is stored as [1] instead of scalar.
+    """
+    import torch
+
+    converted_state_dict = {}
+
+    for key, value in checkpoint.items():
+        # Fix num_batches_tracked shape: GGUF stores as [1], PyTorch expects scalar []
+        if "num_batches_tracked" in key:
+            if hasattr(value, 'shape') and len(value.shape) == 1 and value.shape[0] == 1:
+                value = value.squeeze(0)
+
+        converted_state_dict[key] = value
+
+    return converted_state_dict

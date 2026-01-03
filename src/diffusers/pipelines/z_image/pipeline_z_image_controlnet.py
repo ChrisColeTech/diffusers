@@ -285,14 +285,22 @@ class ZImageControlNetPipeline(DiffusionPipeline, FromSingleFileMixin):
             return_tensors="pt",
         )
 
-        text_input_ids = text_inputs.input_ids.to(device)
-        prompt_masks = text_inputs.attention_mask.to(device).bool()
+        # Get text encoder device (may differ from target device in multi-GPU setup)
+        text_encoder_device = next(self.text_encoder.parameters()).device
+
+        text_input_ids = text_inputs.input_ids.to(text_encoder_device)
+        prompt_masks = text_inputs.attention_mask.to(text_encoder_device).bool()
 
         prompt_embeds = self.text_encoder(
             input_ids=text_input_ids,
             attention_mask=prompt_masks,
             output_hidden_states=True,
         ).hidden_states[-2]
+
+        # Move embeddings to target device (handles multi-GPU where text_encoder is on different device)
+        if prompt_embeds.device != device:
+            prompt_embeds = prompt_embeds.to(device)
+        prompt_masks = prompt_masks.to(device)
 
         embeddings_list = []
 
@@ -551,6 +559,10 @@ class ZImageControlNetPipeline(DiffusionPipeline, FromSingleFileMixin):
         control_image = retrieve_latents(self.vae.encode(control_image), generator=generator, sample_mode="argmax")
         control_image = (control_image - self.vae.config.shift_factor) * self.vae.config.scaling_factor
         control_image = control_image.unsqueeze(2)
+
+        # Cast control_image to ControlNet dtype (handles FP8 transformer with bfloat16 VAE)
+        controlnet_dtype = next(self.controlnet.parameters()).dtype
+        control_image = control_image.to(controlnet_dtype)
 
         if num_channels_latents != self.controlnet.config.control_in_dim:
             # For model version 2.0
