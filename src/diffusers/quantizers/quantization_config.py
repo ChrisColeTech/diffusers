@@ -49,6 +49,7 @@ class QuantizationMethod(str, Enum):
     TORCHAO = "torchao"
     QUANTO = "quanto"
     MODELOPT = "modelopt"
+    FP8 = "fp8"
 
 
 if is_torchao_available():
@@ -437,6 +438,48 @@ class GGUFQuantizationConfig(QuantizationConfigMixin):
 
         if self.compute_dtype is None:
             self.compute_dtype = torch.float32
+
+
+@dataclass
+class FP8QuantizationConfig(QuantizationConfigMixin):
+    """Configuration for FP8 (float8_e4m3fn) quantized models.
+
+    FP8 quantization stores weights in 8-bit floating point format with per-tensor
+    scaling. Weights are dequantized on-the-fly during forward passes:
+        weight_dequant = weight.to(compute_dtype) * weight_scale
+
+    This provides ~50% memory savings compared to bfloat16 while maintaining
+    good accuracy for inference.
+
+    Args:
+        compute_dtype: (`torch.dtype`, defaults to `torch.bfloat16`):
+            The dtype used for computation during forward passes. Inputs and
+            weights are cast to this dtype before matrix multiplication.
+        modules_to_not_convert: (`List[str]`, *optional*, defaults to `None`):
+            List of module names to keep in full precision. Useful for modules
+            that are sensitive to quantization.
+
+    Example:
+        ```python
+        from diffusers import Flux2Transformer2DModel, FP8QuantizationConfig
+
+        quantization_config = FP8QuantizationConfig(compute_dtype=torch.bfloat16)
+        transformer = Flux2Transformer2DModel.from_pretrained(
+            "path/to/fp8-model",
+            quantization_config=quantization_config,
+        )
+        ```
+    """
+
+    def __init__(
+        self,
+        compute_dtype: Optional["torch.dtype"] = None,
+        modules_to_not_convert: Optional[List[str]] = None,
+    ):
+        self.quant_method = QuantizationMethod.FP8
+        self.compute_dtype = compute_dtype if compute_dtype is not None else torch.bfloat16
+        self.modules_to_not_convert = modules_to_not_convert
+        self.pre_quantized = True
 
 
 @dataclass
