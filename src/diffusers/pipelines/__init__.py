@@ -15,6 +15,7 @@ from ..utils import (
     is_torch_available,
     is_torch_npu_available,
     is_transformers_available,
+    is_transformers_version,
 )
 
 
@@ -288,7 +289,9 @@ else:
         "LTXImageToVideoPipeline",
         "LTXConditionPipeline",
         "LTXLatentUpsamplePipeline",
+        "LTXI2VLongMultiPromptPipeline",
     ]
+    _import_structure["ltx2"] = ["LTX2Pipeline", "LTX2ImageToVideoPipeline", "LTX2LatentUpsamplePipeline"]
     _import_structure["lumina"] = ["LuminaPipeline", "LuminaText2ImgPipeline"]
     _import_structure["lumina2"] = ["Lumina2Pipeline", "Lumina2Text2ImgPipeline"]
     _import_structure["lucy"] = ["LucyEditPipeline"]
@@ -411,6 +414,7 @@ else:
         "ZImagePipeline",
         "ZImageControlNetPipeline",
         "ZImageControlNetInpaintPipeline",
+        "ZImageOmniPipeline",
     ]
     _import_structure["skyreels_v2"] = [
         "SkyReelsV2DiffusionForcingPipeline",
@@ -431,6 +435,8 @@ else:
         "QwenImageLayeredPipeline",
     ]
     _import_structure["chronoedit"] = ["ChronoEditPipeline"]
+    _import_structure["glm_image"] = ["GlmImagePipeline"]
+
 try:
     if not is_onnx_available():
         raise OptionalDependencyNotAvailable()
@@ -673,6 +679,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             ReduxImageEncoder,
         )
         from .flux2 import Flux2Pipeline
+        from .glm_image import GlmImagePipeline
         from .hidream_image import HiDreamImagePipeline
         from .hunyuan_image import HunyuanImagePipeline, HunyuanImageRefinerPipeline
         from .hunyuan_video import (
@@ -728,7 +735,14 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             LEditsPPPipelineStableDiffusionXL,
         )
         from .longcat_image import LongCatImageEditPipeline, LongCatImagePipeline
-        from .ltx import LTXConditionPipeline, LTXImageToVideoPipeline, LTXLatentUpsamplePipeline, LTXPipeline
+        from .ltx import (
+            LTXConditionPipeline,
+            LTXI2VLongMultiPromptPipeline,
+            LTXImageToVideoPipeline,
+            LTXLatentUpsamplePipeline,
+            LTXPipeline,
+        )
+        from .ltx2 import LTX2ImageToVideoPipeline, LTX2LatentUpsamplePipeline, LTX2Pipeline
         from .lucy import LucyEditPipeline
         from .lumina import LuminaPipeline, LuminaText2ImgPipeline
         from .lumina2 import Lumina2Pipeline, Lumina2Text2ImgPipeline
@@ -856,6 +870,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             ZImageControlNetInpaintPipeline,
             ZImageControlNetPipeline,
             ZImageImg2ImgPipeline,
+            ZImageOmniPipeline,
             ZImagePipeline,
         )
 
