@@ -176,16 +176,18 @@ class FP8Quantizer(DiffusersQuantizer):
     ):
         """
         Process model before loading weights - replace Linear with FP8Linear.
+
+        We replace ALL nn.Linear unconditionally because for sharded loading,
+        state_dict is None at this point. The weight loading phase will handle
+        assigning FP8 weights and weight_scale tensors correctly.
         """
         from .utils import _replace_with_fp8_linear
-
-        state_dict = kwargs.get("state_dict", None)
 
         self.modules_to_not_convert.extend(keep_in_fp32_modules)
         self.modules_to_not_convert = [m for m in self.modules_to_not_convert if m is not None]
 
         _replace_with_fp8_linear(
-            model, self.compute_dtype, state_dict, modules_to_not_convert=self.modules_to_not_convert
+            model, self.compute_dtype, modules_to_not_convert=self.modules_to_not_convert
         )
 
     def _process_model_after_weight_loading(self, model: "ModelMixin", **kwargs):

@@ -160,58 +160,26 @@ class FP8Linear(nn.Module):
         return f'in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, fp8=True'
 
 
-def _should_convert_to_fp8(state_dict, prefix):
-    """Check if a module should be converted to FP8Linear based on state_dict."""
-    if state_dict is None:
-        return False
-
-    weight_key = prefix + "weight"
-    scale_key = prefix + "weight_scale"
-
-    if weight_key not in state_dict:
-        return False
-
-    weight = state_dict[weight_key]
-
-    # Check if weight is FP8Parameter or FP8 dtype
-    if isinstance(weight, FP8Parameter):
-        return True
-
-    # Check dtype for FP8
-    if hasattr(weight, 'dtype') and weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        return True
-
-    # Check if weight_scale exists (indicates FP8 quantized weight)
-    if scale_key in state_dict:
-        return True
-
-    return False
-
-
-def _replace_with_fp8_linear(model, compute_dtype, state_dict, prefix="", modules_to_not_convert=[]):
+def _replace_with_fp8_linear(model, compute_dtype, prefix="", modules_to_not_convert=[]):
     """
-    Recursively replace nn.Linear modules with FP8Linear based on state_dict.
+    Recursively replace ALL nn.Linear modules with FP8Linear.
+
+    When using FP8QuantizationConfig, we replace unconditionally because:
+    - For sharded loading, state_dict is None at preprocess_model time
+    - Weight loading will assign FP8 weights + weight_scale correctly
+    - Non-FP8 layers work fine (scale=1.0 is a no-op)
 
     Args:
         model: The model to modify
         compute_dtype: Computation dtype (bfloat16/float16)
-        state_dict: State dict containing FP8 weights
         prefix: Current module prefix for state_dict keys
         modules_to_not_convert: List of module names to skip
     """
-    has_children = list(model.children())
-    if not has_children:
-        return
-
     for name, module in model.named_children():
         module_prefix = prefix + name + "."
-        _replace_with_fp8_linear(module, compute_dtype, state_dict, module_prefix, modules_to_not_convert)
+        _replace_with_fp8_linear(module, compute_dtype, module_prefix, modules_to_not_convert)
 
-        if (
-            isinstance(module, nn.Linear)
-            and _should_convert_to_fp8(state_dict, module_prefix)
-            and name not in modules_to_not_convert
-        ):
+        if isinstance(module, nn.Linear) and name not in modules_to_not_convert:
             with init_empty_weights():
                 model._modules[name] = FP8Linear(
                     module.in_features,

@@ -496,6 +496,10 @@ class Flux2SingleTransformerBlock(nn.Module):
             hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         mod_shift, mod_scale, mod_gate = temb_mod_params
+        
+        # Ensure modulation params are on same device as hidden_states (for CPU offload mode)
+        device = hidden_states.device
+        mod_shift, mod_scale, mod_gate = mod_shift.to(device), mod_scale.to(device), mod_gate.to(device)
 
         norm_hidden_states = self.norm(hidden_states)
         norm_hidden_states = (1 + mod_scale) * norm_hidden_states + mod_shift
@@ -567,6 +571,14 @@ class Flux2TransformerBlock(nn.Module):
         # Modulation parameters shape: [1, 1, self.dim]
         (shift_msa, scale_msa, gate_msa), (shift_mlp, scale_mlp, gate_mlp) = temb_mod_params_img
         (c_shift_msa, c_scale_msa, c_gate_msa), (c_shift_mlp, c_scale_mlp, c_gate_mlp) = temb_mod_params_txt
+        
+        # Ensure modulation params are on same device as hidden_states (for CPU offload mode)
+        device = hidden_states.device
+        shift_msa, scale_msa, gate_msa = shift_msa.to(device), scale_msa.to(device), gate_msa.to(device)
+        shift_mlp, scale_mlp, gate_mlp = shift_mlp.to(device), scale_mlp.to(device), gate_mlp.to(device)
+        c_shift_msa, c_scale_msa, c_gate_msa = c_shift_msa.to(device), c_scale_msa.to(device), c_gate_msa.to(device)
+        c_shift_mlp, c_scale_mlp, c_gate_mlp = c_shift_mlp.to(device), c_scale_mlp.to(device), c_gate_mlp.to(device)
+        encoder_hidden_states = encoder_hidden_states.to(device)
 
         # Img stream
         norm_hidden_states = self.norm1(hidden_states)
@@ -828,6 +840,8 @@ class Flux2Transformer2DModel(
         txt_ids: torch.Tensor = None,
         guidance: torch.Tensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        block_controlnet_hidden_states: Optional[List[torch.Tensor]] = None,
+        controlnet_single_block_samples: Optional[List[torch.Tensor]] = None,
         return_dict: bool = True,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         """
@@ -930,6 +944,10 @@ class Flux2Transformer2DModel(
                     image_rotary_emb=concat_rotary_emb,
                     joint_attention_kwargs=joint_attention_kwargs,
                 )
+
+            # Add ControlNet residuals for double stream blocks
+            if block_controlnet_hidden_states is not None and index_block < len(block_controlnet_hidden_states):
+                hidden_states = hidden_states + block_controlnet_hidden_states[index_block]
         # Concatenate text and image streams for single-block inference
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
@@ -952,10 +970,15 @@ class Flux2Transformer2DModel(
                     image_rotary_emb=concat_rotary_emb,
                     joint_attention_kwargs=joint_attention_kwargs,
                 )
+
+            # Add ControlNet residuals for single stream blocks
+            if controlnet_single_block_samples is not None and index_block < len(controlnet_single_block_samples):
+                hidden_states = hidden_states + controlnet_single_block_samples[index_block]
         # Remove text tokens from concatenated stream
         hidden_states = hidden_states[:, num_txt_tokens:, ...]
 
         # 6. Output layers
+        temb = temb.to(hidden_states.device)  # Ensure temb matches hidden_states device
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 

@@ -213,8 +213,12 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
         self.tokenizer_max_length = 1024
 
+        # Template for image editing (with input image)
         self.prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
         self.prompt_template_encode_start_idx = 64
+        # Template for text-to-image (no input image)
+        self.prompt_template_txt2img = "<|im_start|>system\nYou are a helpful assistant that generates high-quality images based on text descriptions. Create a detailed, visually appealing image that accurately represents the user's description.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+        self.prompt_template_txt2img_start_idx = 38  # Shorter system prompt = fewer tokens to drop
         self.default_sample_size = 128
 
     # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._extract_masked_hidden
@@ -247,9 +251,13 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
         else:
             base_img_prompt = ""
 
-        template = self.prompt_template_encode
-
-        drop_idx = self.prompt_template_encode_start_idx
+        # Use txt2img template when no image is provided, otherwise use edit template
+        if image is None:
+            template = self.prompt_template_txt2img
+            drop_idx = self.prompt_template_txt2img_start_idx
+        else:
+            template = self.prompt_template_encode
+            drop_idx = self.prompt_template_encode_start_idx
         txt = [template.format(base_img_prompt + e) for e in prompt]
 
         model_inputs = self.processor(
@@ -839,6 +847,8 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
                 if image_latents is not None:
                     latent_model_input = torch.cat([latents, image_latents], dim=1)
 
+
+
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype).to(latents.device)
                 with self.transformer.cache_context("cond"):
@@ -848,6 +858,8 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
                         guidance=guidance,
                         encoder_hidden_states_mask=prompt_embeds_mask,
                         encoder_hidden_states=prompt_embeds,
+
+
                         img_shapes=img_shapes,
                         txt_seq_lens=txt_seq_lens,
                         attention_kwargs=self.attention_kwargs,

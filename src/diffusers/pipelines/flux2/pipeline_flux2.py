@@ -335,6 +335,11 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         input_ids = inputs["input_ids"].to(device)
         attention_mask = inputs["attention_mask"].to(device)
 
+        # DEBUG: Log input info
+        logger.info(f"[DEBUG] Text encoder input_ids shape: {input_ids.shape}, device: {input_ids.device}")
+        logger.info(f"[DEBUG] Text encoder dtype: {text_encoder.dtype}, device: {device}")
+        logger.info(f"[DEBUG] Hidden states layers: {hidden_states_layers}")
+
         # Forward pass through the model
         output = text_encoder(
             input_ids=input_ids,
@@ -343,12 +348,28 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             use_cache=False,
         )
 
+        # DEBUG: Log hidden states info
+        logger.info(f"[DEBUG] Number of hidden states: {len(output.hidden_states)}")
+        for i, hs in enumerate(output.hidden_states):
+            if i in hidden_states_layers or i == 0 or i == len(output.hidden_states) - 1:
+                has_nan = torch.isnan(hs).any().item()
+                has_inf = torch.isinf(hs).any().item()
+                logger.info(f"[DEBUG] hidden_states[{i}]: shape={hs.shape}, min={float(hs.min()):.4f}, max={float(hs.max()):.4f}, std={float(hs.std()):.4f}, nan={has_nan}, inf={has_inf}")
+
         # Only use outputs from intermediate layers and stack them
         out = torch.stack([output.hidden_states[k] for k in hidden_states_layers], dim=1)
         out = out.to(dtype=dtype, device=device)
 
         batch_size, num_channels, seq_len, hidden_dim = out.shape
         prompt_embeds = out.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_channels * hidden_dim)
+
+        # DEBUG: Log final embeddings
+        has_nan = torch.isnan(prompt_embeds).any().item()
+        has_inf = torch.isinf(prompt_embeds).any().item()
+        logger.info(f"[DEBUG] prompt_embeds: shape={prompt_embeds.shape}, min={float(prompt_embeds.min()):.4f}, max={float(prompt_embeds.max()):.4f}, std={float(prompt_embeds.std()):.4f}")
+        logger.info(f"[DEBUG] prompt_embeds: has_nan={has_nan}, has_inf={has_inf}")
+        if has_nan or has_inf:
+            logger.error("[DEBUG] *** EMBEDDINGS CONTAIN NaN or Inf - TEXT ENCODER IS BROKEN ***")
 
         return prompt_embeds
 
@@ -934,9 +955,11 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             )
 
         # 6. Prepare timesteps - use transformer device for multi-GPU setups
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
-        if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
-            sigmas = None
+        # For Flux2 with dynamic shifting, let the scheduler compute sigmas from its configured
+        # sigma_min/sigma_max range (1.0 to 0.001). This ensures sigmas properly cover the full
+        # denoising range. The old formula np.linspace(1.0, 1/n, n) stopped at 0.25 for 4 steps,
+        # which after dynamic shifting clustered near 1.0 causing incomplete denoising.
+        # When sigmas=None, scheduler.set_timesteps computes from timesteps [1000...1] -> [1.0...0.001]
         image_seq_len = latents.shape[1]
         mu = compute_empirical_mu(image_seq_len=image_seq_len, num_steps=num_inference_steps)
         timesteps, num_inference_steps = retrieve_timesteps(
@@ -957,6 +980,13 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         # We set the index here to remove DtoH sync, helpful especially during compilation.
         # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
         self.scheduler.set_begin_index(0)
+        # Determine compute dtype: use quantizer's compute_dtype for quantized models,
+        # otherwise use transformer.dtype. This avoids casting inputs to FP8 weight dtype.
+        if hasattr(self.transformer, 'hf_quantizer') and self.transformer.hf_quantizer is not None:
+            compute_dtype = self.transformer.hf_quantizer.compute_dtype
+        else:
+            compute_dtype = self.transformer.dtype
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -966,11 +996,11 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-                latent_model_input = latents.to(self.transformer.dtype)
+                latent_model_input = latents.to(compute_dtype)
                 latent_image_ids = latent_ids
 
                 if image_latents is not None:
-                    latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
+                    latent_model_input = torch.cat([latents, image_latents], dim=1).to(compute_dtype)
                     latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
                 noise_pred = self.transformer(
@@ -1018,13 +1048,17 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         else:
             latents = self._unpack_latents_with_ids(latents, latent_ids)
 
+            # Step 1: Batch norm denormalization (128 channels, patchified)
             latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
             latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
                 latents.device, latents.dtype
             )
             latents = latents * latents_bn_std + latents_bn_mean
+
+            # Step 2: Unpatchify (128 -> 32 channels)
             latents = self._unpatchify_latents(latents)
 
+            # BN-only decode (no additional VAE scaling) - baseline test
             image = self.vae.decode(latents, return_dict=False)[0]
             image = self.image_processor.postprocess(image, output_type=output_type)
 

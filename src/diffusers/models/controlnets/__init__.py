@@ -4,6 +4,7 @@ from ...utils import is_flax_available, is_torch_available
 if is_torch_available():
     from .controlnet import ControlNetModel, ControlNetOutput
     from .controlnet_flux import FluxControlNetModel, FluxControlNetOutput, FluxMultiControlNetModel
+    from .controlnet_flux2 import Flux2ControlNetModel, Flux2ControlNetOutput, Flux2MultiControlNetModel
     from .controlnet_hunyuan import (
         HunyuanControlNetOutput,
         HunyuanDiT2DControlNetModel,
