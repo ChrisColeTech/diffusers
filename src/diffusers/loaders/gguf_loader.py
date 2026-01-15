@@ -41,6 +41,9 @@ class CombinedGGUFLoader:
     COMPONENT_PREFIXES = {
         "transformer": ["transformer."],
         "vae": ["vae."],
+        "audio_vae": ["audio_vae."],
+        "vocoder": ["vocoder."],
+        "connectors": ["connectors."],
         "text_encoder": [
             "text_encoder.",  # Diffusers-style prefix (e.g., text_encoder.model.layers.*)
             "blk.",
@@ -66,28 +69,41 @@ class CombinedGGUFLoader:
             )
         self.gguf_path = gguf_path
 
-    def load(self) -> Dict[str, Dict[str, torch.Tensor]]:
+    def load(self, components: list = None) -> Dict[str, Dict[str, torch.Tensor]]:
         """
         Read GGUF file and return split state dicts.
 
+        Args:
+            components: Optional list of components to load (e.g., ["transformer", "vae"]).
+                       If None, loads all components. Use this to reduce memory usage by
+                       loading one component at a time.
+
         Returns:
-            Dict with keys: "transformer", "vae", "text_encoder".
+            Dict with keys: "transformer", "vae", "text_encoder", etc.
             Each value is a state dict for that component.
         """
         reader = gguf.GGUFReader(self.gguf_path)
 
-        result = {
-            "transformer": {},
-            "vae": {},
-            "text_encoder": {},
-        }
+        all_components = ["transformer", "vae", "audio_vae", "vocoder", "connectors", "text_encoder"]
+        if components is None:
+            components = all_components
+
+        result = {c: {} for c in all_components}
 
         # Track tensor counts for logging
-        counts = {"transformer": 0, "vae": 0, "text_encoder": 0}
+        counts = {c: 0 for c in all_components}
 
         for tensor in reader.tensors:
             name = tensor.name
+
+            # Determine component early to skip unwanted tensors
+            component, _ = self._get_component_and_key(name)
+            if component not in components:
+                continue
+
             quant_type = tensor.tensor_type
+            # Use numpy array directly without copy when possible
+            # The .copy() is needed because GGUF uses mmap and tensor.data is a view
             data = torch.from_numpy(tensor.data.copy())
 
             # Get the logical tensor shape from GGUF header (not byte shape)
@@ -205,8 +221,8 @@ class CombinedGGUFLoader:
         for component, prefixes in self.COMPONENT_PREFIXES.items():
             for prefix in prefixes:
                 if name.startswith(prefix):
-                    if component in ("transformer", "vae"):
-                        # Strip the prefix for transformer and VAE
+                    if component in ("transformer", "vae", "audio_vae", "vocoder", "connectors"):
+                        # Strip the prefix for these components
                         return component, name[len(prefix):]
                     elif prefix == "text_encoder.":
                         # Diffusers-style text_encoder prefix: strip it

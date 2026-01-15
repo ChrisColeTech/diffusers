@@ -223,7 +223,13 @@ class FluxPipeline(
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
-        device = device or self._execution_device
+        # Use text_encoder_2's actual device for multi-GPU compatibility
+        # When using multi-GPU (e.g., text_encoder_2 on cuda:1), we need to use its actual device
+        if device is None:
+            if self.text_encoder_2 is not None:
+                device = next(self.text_encoder_2.parameters()).device
+            else:
+                device = self._execution_device
         dtype = dtype or self.text_encoder.dtype
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
@@ -270,7 +276,13 @@ class FluxPipeline(
         num_images_per_prompt: int = 1,
         device: Optional[torch.device] = None,
     ):
-        device = device or self._execution_device
+        # Use text_encoder's actual device for multi-GPU compatibility
+        # When using multi-GPU (e.g., text_encoder on cuda:1), we need to use its actual device
+        if device is None:
+            if self.text_encoder is not None:
+                device = next(self.text_encoder.parameters()).device
+            else:
+                device = self._execution_device
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
@@ -934,6 +946,24 @@ class FluxPipeline(
         # We set the index here to remove DtoH sync, helpful especially during compilation.
         # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
         self.scheduler.set_begin_index(0)
+        
+        # Move tensors to transformer device for multi-GPU compatibility
+        # When using multi-GPU (e.g., transformer on cuda:0, text_encoder on cuda:1),
+        # tensors may be on different devices than the transformer
+        transformer_device = next(self.transformer.parameters()).device
+        latents = latents.to(transformer_device)
+        prompt_embeds = prompt_embeds.to(transformer_device)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(transformer_device)
+        text_ids = text_ids.to(transformer_device)
+        latent_image_ids = latent_image_ids.to(transformer_device)
+        timesteps = timesteps.to(transformer_device)
+        if guidance is not None:
+            guidance = guidance.to(transformer_device)
+        if do_true_cfg:
+            negative_prompt_embeds = negative_prompt_embeds.to(transformer_device)
+            negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(transformer_device)
+            negative_text_ids = negative_text_ids.to(transformer_device)
+        
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:

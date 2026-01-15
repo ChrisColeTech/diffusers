@@ -983,7 +983,13 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         # Determine compute dtype: use quantizer's compute_dtype for quantized models,
         # otherwise use transformer.dtype. This avoids casting inputs to FP8 weight dtype.
         if hasattr(self.transformer, 'hf_quantizer') and self.transformer.hf_quantizer is not None:
-            compute_dtype = self.transformer.hf_quantizer.compute_dtype
+            # Support both compute_dtype (FP8) and torch_dtype (SDNQ)
+            if hasattr(self.transformer.hf_quantizer, 'compute_dtype'):
+                compute_dtype = self.transformer.hf_quantizer.compute_dtype
+            elif hasattr(self.transformer.hf_quantizer, 'torch_dtype'):
+                compute_dtype = self.transformer.hf_quantizer.torch_dtype
+            else:
+                compute_dtype = self.transformer.dtype
         else:
             compute_dtype = self.transformer.dtype
 

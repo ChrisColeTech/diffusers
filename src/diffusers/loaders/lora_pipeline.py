@@ -2229,16 +2229,20 @@ class FluxLoraLoaderMixin(LoraBaseMixin):
         base_module: "torch.nn.Linear" = None,
         base_weight_param_name: str = None,
     ) -> "torch.Size":
-        def _get_weight_shape(weight: torch.Tensor):
+        def _get_weight_shape(weight: torch.Tensor, module: torch.nn.Module = None):
             if weight.__class__.__name__ == "Params4bit":
                 return weight.quant_state.shape
             elif weight.__class__.__name__ == "GGUFParameter":
                 return weight.quant_shape
             else:
+                # Handle SDNQ and other quantization schemes that flatten weights to 1D
+                # Fall back to module.out_features/in_features if weight is 1D
+                if weight.ndim == 1 and module is not None and hasattr(module, 'out_features') and hasattr(module, 'in_features'):
+                    return torch.Size([module.out_features, module.in_features])
                 return weight.shape
 
         if base_module is not None:
-            return _get_weight_shape(base_module.weight)
+            return _get_weight_shape(base_module.weight, base_module)
         elif base_weight_param_name is not None:
             if not base_weight_param_name.endswith(".weight"):
                 raise ValueError(
@@ -2246,7 +2250,7 @@ class FluxLoraLoaderMixin(LoraBaseMixin):
                 )
             module_path = base_weight_param_name.rsplit(".weight", 1)[0]
             submodule = get_submodule_by_name(model, module_path)
-            return _get_weight_shape(submodule.weight)
+            return _get_weight_shape(submodule.weight, submodule)
 
         raise ValueError("Either `base_module` or `base_weight_param_name` must be provided.")
 
