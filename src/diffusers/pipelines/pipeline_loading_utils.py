@@ -711,6 +711,34 @@ def _get_final_device_map(device_map, pipeline_class, passed_class_obj, init_dic
         for module_name, module in init_empty_modules.items()
         if isinstance(module, torch.nn.Module)
     }
+
+    # For quantized models, use actual file sizes instead of computed sizes
+    # This fixes device_map for SDNQ and other quantized models
+    cached_folder = kwargs.get("cached_folder", None)
+    if cached_folder is not None:
+        import os
+        for module_name in module_sizes:
+            module_path = os.path.join(cached_folder, module_name)
+            if os.path.isdir(module_path):
+                # Check if module has quantization config
+                config_path = os.path.join(module_path, "config.json")
+                if os.path.exists(config_path):
+                    try:
+                        import json
+                        with open(config_path) as f:
+                            config = json.load(f)
+                        if "quantization_config" in config:
+                            # Use actual file size for quantized models
+                            actual_size = sum(
+                                os.path.getsize(os.path.join(module_path, f))
+                                for f in os.listdir(module_path)
+                                if f.endswith(".safetensors")
+                            )
+                            if actual_size > 0:
+                                module_sizes[module_name] = actual_size
+                    except Exception:
+                        pass  # Fall back to computed size on any error
+
     module_sizes = dict(sorted(module_sizes.items(), key=lambda item: item[1], reverse=True))
 
     # Obtain maximum memory available per device (GPUs only).

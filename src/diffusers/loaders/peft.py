@@ -378,6 +378,19 @@ class PeftAdapterMixin:
 
             _maybe_warn_for_unhandled_keys(incompatible_keys, adapter_name)
 
+            # Handle device_map scenarios - move LoRA weights to match base layer devices
+            if hasattr(self, 'hf_device_map') and self.hf_device_map is not None:
+                for name, module in self.named_modules():
+                    if hasattr(module, 'lora_A') and hasattr(module, 'base_layer'):
+                        base_device = module.base_layer.weight.device
+                        if base_device.type != 'meta':
+                            for lora_attr in ['lora_A', 'lora_B']:
+                                lora_dict = getattr(module, lora_attr, None)
+                                if lora_dict is not None:
+                                    for adapter_name_key, lora_layer in lora_dict.items():
+                                        if lora_layer.weight.device != base_device:
+                                            lora_layer.to(base_device)
+
             # Offload back.
             if is_model_cpu_offload:
                 _pipeline.enable_model_cpu_offload()

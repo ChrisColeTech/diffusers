@@ -468,16 +468,20 @@ class LTX2VideoTransformerBlock(nn.Module):
         norm_hidden_states = self.norm1(hidden_states)
 
         num_ada_params = self.scale_shift_table.shape[0]
-        # Compute ada_values from temb (which may be compact with num_unique timesteps)
+        # temb may be compact [batch, num_unique, dim] or full [batch, num_tokens, dim]
         ada_values = self.scale_shift_table[None, None].to(temb.device) + temb.reshape(
             batch_size, temb.size(1), num_ada_params, -1
         )
 
-        # If temb_indices provided, expand to per-token; otherwise temb is already per-token or broadcasts
+        # If temb_indices provided and temb is compact, expand to per-token
         if temb_indices is not None and temb.size(1) < num_tokens:
-            # ada_values shape: [batch, num_unique, 6, inner_dim]
-            # Expand to [batch, num_tokens, 6, inner_dim] using indices
-            ada_values = ada_values[:, temb_indices, :, :]
+            # temb_indices: [batch, num_tokens] -> gather from [batch, num_unique, 6, inner_dim]
+            # We need to expand ada_values from [batch, num_unique, 6, dim] to [batch, num_tokens, 6, dim]
+            ada_values = torch.gather(
+                ada_values,
+                dim=1,
+                index=temb_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, ada_values.size(2), ada_values.size(3))
+            )
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = ada_values.unbind(dim=2)
         norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
@@ -535,28 +539,45 @@ class LTX2VideoTransformerBlock(nn.Module):
         video_per_layer_ca_scale_shift = self.video_a2v_cross_attn_scale_shift_table[:4, :]
         video_per_layer_ca_gate = self.video_a2v_cross_attn_scale_shift_table[4:, :]
 
-        video_ca_scale_shift_table = (
-            video_per_layer_ca_scale_shift[:, :, ...].to(temb_ca_scale_shift.dtype)
+        video_ca_scale_shift_combined = (
+            video_per_layer_ca_scale_shift.reshape(1, 1, 4, -1).to(temb_ca_scale_shift.dtype)
             + temb_ca_scale_shift.reshape(batch_size, temb_ca_scale_shift.shape[1], 4, -1)
-        ).unbind(dim=2)
-        video_ca_gate = (
-            video_per_layer_ca_gate[:, :, ...].to(temb_ca_gate.dtype)
+        )
+        video_ca_gate_combined = (
+            video_per_layer_ca_gate.reshape(1, 1, 1, -1).to(temb_ca_gate.dtype)
             + temb_ca_gate.reshape(batch_size, temb_ca_gate.shape[1], 1, -1)
-        ).unbind(dim=2)
+        )
+
+        # If temb_indices provided and cross-attn embeddings are compact, expand to per-token
+        if temb_indices is not None and temb_ca_scale_shift.shape[1] < num_tokens:
+            video_ca_scale_shift_combined = torch.gather(
+                video_ca_scale_shift_combined,
+                dim=1,
+                index=temb_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 4, video_ca_scale_shift_combined.size(3))
+            )
+            video_ca_gate_combined = torch.gather(
+                video_ca_gate_combined,
+                dim=1,
+                index=temb_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, video_ca_gate_combined.size(3))
+            )
+
+        video_ca_scale_shift_table = video_ca_scale_shift_combined.unbind(dim=2)
+        video_ca_gate = video_ca_gate_combined.unbind(dim=2)
 
         video_a2v_ca_scale, video_a2v_ca_shift, video_v2a_ca_scale, video_v2a_ca_shift = video_ca_scale_shift_table
         a2v_gate = video_ca_gate[0].squeeze(2)
 
         # Audio
+        num_audio_tokens = audio_hidden_states.size(1)
         audio_per_layer_ca_scale_shift = self.audio_a2v_cross_attn_scale_shift_table[:4, :]
         audio_per_layer_ca_gate = self.audio_a2v_cross_attn_scale_shift_table[4:, :]
 
         audio_ca_scale_shift_table = (
-            audio_per_layer_ca_scale_shift[:, :, ...].to(temb_ca_audio_scale_shift.dtype)
+            audio_per_layer_ca_scale_shift.reshape(1, 1, 4, -1).to(temb_ca_audio_scale_shift.dtype)
             + temb_ca_audio_scale_shift.reshape(batch_size, temb_ca_audio_scale_shift.shape[1], 4, -1)
         ).unbind(dim=2)
         audio_ca_gate = (
-            audio_per_layer_ca_gate[:, :, ...].to(temb_ca_audio_gate.dtype)
+            audio_per_layer_ca_gate.reshape(1, 1, 1, -1).to(temb_ca_audio_gate.dtype)
             + temb_ca_audio_gate.reshape(batch_size, temb_ca_audio_gate.shape[1], 1, -1)
         ).unbind(dim=2)
 
@@ -1241,71 +1262,162 @@ class LTX2VideoTransformer3DModel(
         # temb is used in the transformer blocks (as expected), while embedded_timestep is used for the output layer
         # modulation with scale_shift_table (and similarly for audio)
 
-        # Optimization: For img2vid, timestep is per-token but only has 2 unique values (0 and t).
-        # Compute embeddings only for unique values, keep compact, pass indices to blocks for lazy expansion.
+        # Memory optimization: For img2vid, timestep is per-token [batch, num_tokens] but only has 2 unique values
+        # (0 for conditioning tokens, t for generated tokens). Compute embeddings only for unique values.
         timestep_flat = timestep.flatten()
-        num_total_tokens = timestep_flat.shape[0] // batch_size
+        num_tokens_per_batch = timestep_flat.shape[0] // batch_size
         unique_timesteps, inverse_indices = torch.unique(timestep_flat, return_inverse=True)
         num_unique = unique_timesteps.shape[0]
 
+        # Compute embeddings only for unique timesteps
         temb_unique, embedded_timestep_unique = self.time_embed(
             unique_timesteps,
             batch_size=num_unique,
             hidden_dtype=hidden_states.dtype,
         )
 
-        # Reshape inverse_indices to [batch, num_tokens] for per-batch indexing
-        # Note: inverse_indices maps each token to its unique timestep index
-        temb_indices = inverse_indices.view(batch_size, num_total_tokens)
+        # Reshape indices to [batch, num_tokens] for per-batch indexing in blocks
+        temb_indices = inverse_indices.view(batch_size, num_tokens_per_batch)
 
-        # Keep temb compact as [batch, num_unique, dim] - DON'T expand to full num_tokens
-        # The blocks will use temb_indices to expand only when needed
-        temb = temb_unique.unsqueeze(0).expand(batch_size, -1, -1)  # [batch, num_unique, dim]
+        # Keep temb compact as [batch, num_unique, dim] - blocks will expand using temb_indices
+        temb = temb_unique.unsqueeze(0).expand(batch_size, -1, -1)
         embedded_timestep = embedded_timestep_unique.unsqueeze(0).expand(batch_size, -1, -1)
 
-        temb_audio, audio_embedded_timestep = self.audio_time_embed(
-            audio_timestep.flatten(),
-            batch_size=batch_size,
-            hidden_dtype=audio_hidden_states.dtype,
-        )
-        temb_audio = temb_audio.view(batch_size, -1, temb_audio.size(-1))
-        audio_embedded_timestep = audio_embedded_timestep.view(batch_size, -1, audio_embedded_timestep.size(-1))
+        # Audio timestep handling: Check if audio should use same optimization as video
+        # If audio_timestep is not provided and timestep is per-token, we need to handle carefully
+        num_audio_tokens = audio_hidden_states.size(1)
+        audio_timestep_flat = audio_timestep.flatten()
+
+        # Check if audio_timestep shape matches audio_hidden_states token count
+        if audio_timestep_flat.shape[0] != batch_size * num_audio_tokens:
+            # audio_timestep was likely defaulted from video timestep but has wrong count
+            # In this case, audio should also use the unique optimization if possible
+            if audio_timestep_flat.shape[0] == batch_size:
+                # Scalar timestep per batch - expand to all audio tokens
+                temb_audio, audio_embedded_timestep = self.audio_time_embed(
+                    audio_timestep_flat,
+                    batch_size=batch_size,
+                    hidden_dtype=audio_hidden_states.dtype,
+                )
+                temb_audio = temb_audio.unsqueeze(1).expand(batch_size, num_audio_tokens, -1)
+                audio_embedded_timestep = audio_embedded_timestep.unsqueeze(1).expand(batch_size, num_audio_tokens, -1)
+            else:
+                # Mismatch - likely audio_timestep=timestep but different token counts
+                # Fall back to using unique timesteps from video
+                # Replicate the unique optimization for audio using video's unique timesteps
+                temb_audio, audio_embedded_timestep = self.audio_time_embed(
+                    unique_timesteps,
+                    batch_size=num_unique,
+                    hidden_dtype=audio_hidden_states.dtype,
+                )
+                # Expand using same indices as video (assumes audio has same conditioning pattern)
+                # Reshape indices to match audio token count if needed
+                if temb_indices.shape[1] == num_audio_tokens:
+                    audio_temb_indices = temb_indices
+                else:
+                    # Different token counts - create new indices for audio
+                    # Assume all audio tokens use same timestep pattern as video tokens
+                    # This is a fallback - ideally audio_timestep should be provided correctly
+                    audio_temb_indices = temb_indices[:, :num_audio_tokens] if num_audio_tokens < temb_indices.shape[1] else \
+                                        torch.cat([temb_indices, temb_indices[:, :num_audio_tokens - temb_indices.shape[1]]], dim=1)
+
+                # Keep compact for now - no gather operation since we don't have proper audio indices
+                temb_audio = temb_audio.unsqueeze(0).expand(batch_size, -1, -1)
+                audio_embedded_timestep = audio_embedded_timestep.unsqueeze(0).expand(batch_size, -1, -1)
+                # Expand to full audio token count using gather
+                temb_audio = torch.gather(
+                    temb_audio,
+                    dim=1,
+                    index=audio_temb_indices.unsqueeze(-1).expand(-1, -1, temb_audio.size(-1))
+                )
+                audio_embedded_timestep = torch.gather(
+                    audio_embedded_timestep,
+                    dim=1,
+                    index=audio_temb_indices.unsqueeze(-1).expand(-1, -1, audio_embedded_timestep.size(-1))
+                )
+        else:
+            # Normal case - audio_timestep has correct shape
+            temb_audio, audio_embedded_timestep = self.audio_time_embed(
+                audio_timestep_flat,
+                batch_size=batch_size,
+                hidden_dtype=audio_hidden_states.dtype,
+            )
+            temb_audio = temb_audio.view(batch_size, -1, temb_audio.size(-1))
+            audio_embedded_timestep = audio_embedded_timestep.view(batch_size, -1, audio_embedded_timestep.size(-1))
 
         # 3.2. Prepare global modality cross attention modulation parameters
-        # Use the same unique timesteps optimization
-        video_cross_attn_scale_shift_unique, _ = self.av_cross_attn_video_scale_shift(
+        # Keep compact like temb - compute only for unique timesteps
+        video_cross_attn_scale_shift, _ = self.av_cross_attn_video_scale_shift(
             unique_timesteps,
-            batch_size=unique_timesteps.shape[0],
+            batch_size=num_unique,
             hidden_dtype=hidden_states.dtype,
         )
-        video_cross_attn_a2v_gate_unique, _ = self.av_cross_attn_video_a2v_gate(
+        video_cross_attn_a2v_gate, _ = self.av_cross_attn_video_a2v_gate(
             unique_timesteps * timestep_cross_attn_gate_scale_factor,
-            batch_size=unique_timesteps.shape[0],
+            batch_size=num_unique,
             hidden_dtype=hidden_states.dtype,
         )
-        # Index into unique embeddings
-        video_cross_attn_scale_shift = video_cross_attn_scale_shift_unique[inverse_indices]
-        video_cross_attn_a2v_gate = video_cross_attn_a2v_gate_unique[inverse_indices]
+        # Keep compact as [batch, num_unique, dim] - blocks will expand using temb_indices
+        video_cross_attn_scale_shift = video_cross_attn_scale_shift.unsqueeze(0).expand(batch_size, -1, -1)
+        video_cross_attn_a2v_gate = video_cross_attn_a2v_gate.unsqueeze(0).expand(batch_size, -1, -1)
 
-        video_cross_attn_scale_shift = video_cross_attn_scale_shift.view(
-            batch_size, -1, video_cross_attn_scale_shift.shape[-1]
-        )
-        video_cross_attn_a2v_gate = video_cross_attn_a2v_gate.view(batch_size, -1, video_cross_attn_a2v_gate.shape[-1])
-
-        audio_cross_attn_scale_shift, _ = self.av_cross_attn_audio_scale_shift(
-            audio_timestep.flatten(),
-            batch_size=batch_size,
-            hidden_dtype=audio_hidden_states.dtype,
-        )
-        audio_cross_attn_v2a_gate, _ = self.av_cross_attn_audio_v2a_gate(
-            audio_timestep.flatten() * timestep_cross_attn_gate_scale_factor,
-            batch_size=batch_size,
-            hidden_dtype=audio_hidden_states.dtype,
-        )
-        audio_cross_attn_scale_shift = audio_cross_attn_scale_shift.view(
-            batch_size, -1, audio_cross_attn_scale_shift.shape[-1]
-        )
-        audio_cross_attn_v2a_gate = audio_cross_attn_v2a_gate.view(batch_size, -1, audio_cross_attn_v2a_gate.shape[-1])
+        # Audio cross-attention embeddings - handle shape mismatch like audio temb above
+        if audio_timestep_flat.shape[0] != batch_size * num_audio_tokens:
+            if audio_timestep_flat.shape[0] == batch_size:
+                # Scalar timestep - compute once and expand
+                audio_cross_attn_scale_shift, _ = self.av_cross_attn_audio_scale_shift(
+                    audio_timestep_flat,
+                    batch_size=batch_size,
+                    hidden_dtype=audio_hidden_states.dtype,
+                )
+                audio_cross_attn_v2a_gate, _ = self.av_cross_attn_audio_v2a_gate(
+                    audio_timestep_flat * timestep_cross_attn_gate_scale_factor,
+                    batch_size=batch_size,
+                    hidden_dtype=audio_hidden_states.dtype,
+                )
+                audio_cross_attn_scale_shift = audio_cross_attn_scale_shift.unsqueeze(1).expand(batch_size, num_audio_tokens, -1)
+                audio_cross_attn_v2a_gate = audio_cross_attn_v2a_gate.unsqueeze(1).expand(batch_size, num_audio_tokens, -1)
+            else:
+                # Use unique timesteps and expand with indices
+                audio_cross_attn_scale_shift, _ = self.av_cross_attn_audio_scale_shift(
+                    unique_timesteps,
+                    batch_size=num_unique,
+                    hidden_dtype=audio_hidden_states.dtype,
+                )
+                audio_cross_attn_v2a_gate, _ = self.av_cross_attn_audio_v2a_gate(
+                    unique_timesteps * timestep_cross_attn_gate_scale_factor,
+                    batch_size=num_unique,
+                    hidden_dtype=audio_hidden_states.dtype,
+                )
+                audio_cross_attn_scale_shift = audio_cross_attn_scale_shift.unsqueeze(0).expand(batch_size, -1, -1)
+                audio_cross_attn_v2a_gate = audio_cross_attn_v2a_gate.unsqueeze(0).expand(batch_size, -1, -1)
+                # Expand using audio indices
+                audio_cross_attn_scale_shift = torch.gather(
+                    audio_cross_attn_scale_shift,
+                    dim=1,
+                    index=audio_temb_indices.unsqueeze(-1).expand(-1, -1, audio_cross_attn_scale_shift.size(-1))
+                )
+                audio_cross_attn_v2a_gate = torch.gather(
+                    audio_cross_attn_v2a_gate,
+                    dim=1,
+                    index=audio_temb_indices.unsqueeze(-1).expand(-1, -1, audio_cross_attn_v2a_gate.size(-1))
+                )
+        else:
+            # Normal case
+            audio_cross_attn_scale_shift, _ = self.av_cross_attn_audio_scale_shift(
+                audio_timestep.flatten(),
+                batch_size=batch_size,
+                hidden_dtype=audio_hidden_states.dtype,
+            )
+            audio_cross_attn_v2a_gate, _ = self.av_cross_attn_audio_v2a_gate(
+                audio_timestep.flatten() * timestep_cross_attn_gate_scale_factor,
+                batch_size=batch_size,
+                hidden_dtype=audio_hidden_states.dtype,
+            )
+            audio_cross_attn_scale_shift = audio_cross_attn_scale_shift.view(
+                batch_size, -1, audio_cross_attn_scale_shift.shape[-1]
+            )
+            audio_cross_attn_v2a_gate = audio_cross_attn_v2a_gate.view(batch_size, -1, audio_cross_attn_v2a_gate.shape[-1])
 
         # 4. Prepare prompt embeddings
         encoder_hidden_states = self.caption_projection(encoder_hidden_states)
@@ -1335,6 +1447,9 @@ class LTX2VideoTransformer3DModel(
                     audio_cross_attn_rotary_emb,
                     encoder_attention_mask,
                     audio_encoder_attention_mask,
+                    None,  # a2v_cross_attention_mask
+                    None,  # v2a_cross_attention_mask
+                    temb_indices,
                 )
             else:
                 hidden_states, audio_hidden_states = block(
@@ -1354,10 +1469,23 @@ class LTX2VideoTransformer3DModel(
                     ca_audio_rotary_emb=audio_cross_attn_rotary_emb,
                     encoder_attention_mask=encoder_attention_mask,
                     audio_encoder_attention_mask=audio_encoder_attention_mask,
+                    temb_indices=temb_indices,
                 )
 
         # 6. Output layers (including unpatchification)
-        scale_shift_values = self.scale_shift_table[None, None] + embedded_timestep[:, :, None]
+        # Expand embedded_timestep from compact [batch, num_unique, dim] to [batch, num_tokens, dim] if needed
+        num_output_tokens = hidden_states.size(1)
+        if embedded_timestep.size(1) < num_output_tokens and temb_indices is not None:
+            # Use gather to expand: embedded_timestep is [batch, num_unique, dim], need [batch, num_tokens, dim]
+            embedded_timestep_expanded = torch.gather(
+                embedded_timestep,
+                dim=1,
+                index=temb_indices.unsqueeze(-1).expand(-1, -1, embedded_timestep.size(-1))
+            )
+        else:
+            embedded_timestep_expanded = embedded_timestep
+
+        scale_shift_values = self.scale_shift_table[None, None] + embedded_timestep_expanded[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
         hidden_states = self.norm_out(hidden_states)

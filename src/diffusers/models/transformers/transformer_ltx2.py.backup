@@ -459,26 +459,16 @@ class LTX2VideoTransformerBlock(nn.Module):
         audio_encoder_attention_mask: Optional[torch.Tensor] = None,
         a2v_cross_attention_mask: Optional[torch.Tensor] = None,
         v2a_cross_attention_mask: Optional[torch.Tensor] = None,
-        temb_indices: Optional[torch.Tensor] = None,  # For memory-efficient per-token timestep handling
     ) -> torch.Tensor:
         batch_size = hidden_states.size(0)
-        num_tokens = hidden_states.size(1)
 
         # 1. Video and Audio Self-Attention
         norm_hidden_states = self.norm1(hidden_states)
 
         num_ada_params = self.scale_shift_table.shape[0]
-        # Compute ada_values from temb (which may be compact with num_unique timesteps)
         ada_values = self.scale_shift_table[None, None].to(temb.device) + temb.reshape(
             batch_size, temb.size(1), num_ada_params, -1
         )
-
-        # If temb_indices provided, expand to per-token; otherwise temb is already per-token or broadcasts
-        if temb_indices is not None and temb.size(1) < num_tokens:
-            # ada_values shape: [batch, num_unique, 6, inner_dim]
-            # Expand to [batch, num_tokens, 6, inner_dim] using indices
-            ada_values = ada_values[:, temb_indices, :, :]
-
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = ada_values.unbind(dim=2)
         norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
 
@@ -1242,26 +1232,21 @@ class LTX2VideoTransformer3DModel(
         # modulation with scale_shift_table (and similarly for audio)
 
         # Optimization: For img2vid, timestep is per-token but only has 2 unique values (0 and t).
-        # Compute embeddings only for unique values, keep compact, pass indices to blocks for lazy expansion.
+        # Compute embeddings only for unique values and index into them.
         timestep_flat = timestep.flatten()
-        num_total_tokens = timestep_flat.shape[0] // batch_size
         unique_timesteps, inverse_indices = torch.unique(timestep_flat, return_inverse=True)
-        num_unique = unique_timesteps.shape[0]
 
         temb_unique, embedded_timestep_unique = self.time_embed(
             unique_timesteps,
-            batch_size=num_unique,
+            batch_size=unique_timesteps.shape[0],
             hidden_dtype=hidden_states.dtype,
         )
+        # Index into unique embeddings to get per-token embeddings
+        temb = temb_unique[inverse_indices]
+        embedded_timestep = embedded_timestep_unique[inverse_indices]
 
-        # Reshape inverse_indices to [batch, num_tokens] for per-batch indexing
-        # Note: inverse_indices maps each token to its unique timestep index
-        temb_indices = inverse_indices.view(batch_size, num_total_tokens)
-
-        # Keep temb compact as [batch, num_unique, dim] - DON'T expand to full num_tokens
-        # The blocks will use temb_indices to expand only when needed
-        temb = temb_unique.unsqueeze(0).expand(batch_size, -1, -1)  # [batch, num_unique, dim]
-        embedded_timestep = embedded_timestep_unique.unsqueeze(0).expand(batch_size, -1, -1)
+        temb = temb.view(batch_size, -1, temb.size(-1))
+        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1))
 
         temb_audio, audio_embedded_timestep = self.audio_time_embed(
             audio_timestep.flatten(),

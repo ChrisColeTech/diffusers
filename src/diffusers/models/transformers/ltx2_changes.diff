@@ -1,0 +1,57 @@
+diff --git a/src/diffusers/models/transformers/transformer_ltx2.py b/src/diffusers/models/transformers/transformer_ltx2.py
+index b88f096e8..9ac118c84 100644
+--- a/src/diffusers/models/transformers/transformer_ltx2.py
++++ b/src/diffusers/models/transformers/transformer_ltx2.py
+@@ -1230,11 +1230,21 @@ class LTX2VideoTransformer3DModel(
+         # 3.1. Prepare global modality (video and audio) timestep embedding and modulation parameters
+         # temb is used in the transformer blocks (as expected), while embedded_timestep is used for the output layer
+         # modulation with scale_shift_table (and similarly for audio)
+-        temb, embedded_timestep = self.time_embed(
+-            timestep.flatten(),
+-            batch_size=batch_size,
++
++        # Optimization: For img2vid, timestep is per-token but only has 2 unique values (0 and t).
++        # Compute embeddings only for unique values and index into them.
++        timestep_flat = timestep.flatten()
++        unique_timesteps, inverse_indices = torch.unique(timestep_flat, return_inverse=True)
++
++        temb_unique, embedded_timestep_unique = self.time_embed(
++            unique_timesteps,
++            batch_size=unique_timesteps.shape[0],
+             hidden_dtype=hidden_states.dtype,
+         )
++        # Index into unique embeddings to get per-token embeddings
++        temb = temb_unique[inverse_indices]
++        embedded_timestep = embedded_timestep_unique[inverse_indices]
++
+         temb = temb.view(batch_size, -1, temb.size(-1))
+         embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1))
+ 
+@@ -1247,16 +1257,21 @@ class LTX2VideoTransformer3DModel(
+         audio_embedded_timestep = audio_embedded_timestep.view(batch_size, -1, audio_embedded_timestep.size(-1))
+ 
+         # 3.2. Prepare global modality cross attention modulation parameters
+-        video_cross_attn_scale_shift, _ = self.av_cross_attn_video_scale_shift(
+-            timestep.flatten(),
+-            batch_size=batch_size,
++        # Use the same unique timesteps optimization
++        video_cross_attn_scale_shift_unique, _ = self.av_cross_attn_video_scale_shift(
++            unique_timesteps,
++            batch_size=unique_timesteps.shape[0],
+             hidden_dtype=hidden_states.dtype,
+         )
+-        video_cross_attn_a2v_gate, _ = self.av_cross_attn_video_a2v_gate(
+-            timestep.flatten() * timestep_cross_attn_gate_scale_factor,
+-            batch_size=batch_size,
++        video_cross_attn_a2v_gate_unique, _ = self.av_cross_attn_video_a2v_gate(
++            unique_timesteps * timestep_cross_attn_gate_scale_factor,
++            batch_size=unique_timesteps.shape[0],
+             hidden_dtype=hidden_states.dtype,
+         )
++        # Index into unique embeddings
++        video_cross_attn_scale_shift = video_cross_attn_scale_shift_unique[inverse_indices]
++        video_cross_attn_a2v_gate = video_cross_attn_a2v_gate_unique[inverse_indices]
++
+         video_cross_attn_scale_shift = video_cross_attn_scale_shift.view(
+             batch_size, -1, video_cross_attn_scale_shift.shape[-1]
+         )
