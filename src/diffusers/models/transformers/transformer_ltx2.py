@@ -476,11 +476,14 @@ class LTX2VideoTransformerBlock(nn.Module):
         # If temb_indices provided, expand to per-token; otherwise temb is already per-token or broadcasts
         if temb_indices is not None and temb.size(1) < num_tokens:
             # ada_values shape: [batch, num_unique, 6, inner_dim]
-            # Expand to [batch, num_tokens, 6, inner_dim] using indices
-            ada_values = ada_values[:, temb_indices, :, :]
+            # Expand to [batch, num_tokens, 6, inner_dim] using per-batch indexing
+            batch_idx = torch.arange(batch_size, device=ada_values.device)[:, None]
+            ada_values = ada_values[batch_idx, temb_indices]  # [batch, num_tokens, 6, inner_dim]
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = ada_values.unbind(dim=2)
+        del ada_values  # Free memory immediately after unbinding
         norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
+        del shift_msa, scale_msa  # Free after use
 
         attn_hidden_states = self.attn1(
             hidden_states=norm_hidden_states,
@@ -488,6 +491,7 @@ class LTX2VideoTransformerBlock(nn.Module):
             query_rotary_emb=video_rotary_emb,
         )
         hidden_states = hidden_states + attn_hidden_states * gate_msa
+        del gate_msa  # Free after use
 
         norm_audio_hidden_states = self.audio_norm1(audio_hidden_states)
 
@@ -530,22 +534,32 @@ class LTX2VideoTransformerBlock(nn.Module):
         norm_hidden_states = self.audio_to_video_norm(hidden_states)
         norm_audio_hidden_states = self.video_to_audio_norm(audio_hidden_states)
 
+        # Expand compact cross-attention params if needed (for memory-efficient img2vid)
+        _temb_ca_scale_shift = temb_ca_scale_shift
+        _temb_ca_gate = temb_ca_gate
+        if temb_indices is not None and temb_ca_scale_shift.size(1) < num_tokens:
+            batch_idx = torch.arange(batch_size, device=temb_ca_scale_shift.device)[:, None]
+            _temb_ca_scale_shift = temb_ca_scale_shift[batch_idx, temb_indices]
+            _temb_ca_gate = temb_ca_gate[batch_idx, temb_indices]
+
         # Combine global and per-layer cross attention modulation parameters
         # Video
         video_per_layer_ca_scale_shift = self.video_a2v_cross_attn_scale_shift_table[:4, :]
         video_per_layer_ca_gate = self.video_a2v_cross_attn_scale_shift_table[4:, :]
 
         video_ca_scale_shift_table = (
-            video_per_layer_ca_scale_shift[:, :, ...].to(temb_ca_scale_shift.dtype)
-            + temb_ca_scale_shift.reshape(batch_size, temb_ca_scale_shift.shape[1], 4, -1)
+            video_per_layer_ca_scale_shift[:, :, ...].to(_temb_ca_scale_shift.dtype)
+            + _temb_ca_scale_shift.reshape(batch_size, _temb_ca_scale_shift.shape[1], 4, -1)
         ).unbind(dim=2)
         video_ca_gate = (
-            video_per_layer_ca_gate[:, :, ...].to(temb_ca_gate.dtype)
-            + temb_ca_gate.reshape(batch_size, temb_ca_gate.shape[1], 1, -1)
+            video_per_layer_ca_gate[:, :, ...].to(_temb_ca_gate.dtype)
+            + _temb_ca_gate.reshape(batch_size, _temb_ca_gate.shape[1], 1, -1)
         ).unbind(dim=2)
 
         video_a2v_ca_scale, video_a2v_ca_shift, video_v2a_ca_scale, video_v2a_ca_shift = video_ca_scale_shift_table
+        del video_ca_scale_shift_table  # Free after unpacking
         a2v_gate = video_ca_gate[0].squeeze(2)
+        del video_ca_gate  # Free after use
 
         # Audio
         audio_per_layer_ca_scale_shift = self.audio_a2v_cross_attn_scale_shift_table[:4, :]
@@ -561,7 +575,9 @@ class LTX2VideoTransformerBlock(nn.Module):
         ).unbind(dim=2)
 
         audio_a2v_ca_scale, audio_a2v_ca_shift, audio_v2a_ca_scale, audio_v2a_ca_shift = audio_ca_scale_shift_table
+        del audio_ca_scale_shift_table  # Free after unpacking
         v2a_gate = audio_ca_gate[0].squeeze(2)
+        del audio_ca_gate  # Free after use
 
         # Audio-to-Video Cross Attention: Q: Video; K,V: Audio
         mod_norm_hidden_states = norm_hidden_states * (1 + video_a2v_ca_scale.squeeze(2)) + video_a2v_ca_shift.squeeze(
@@ -580,6 +596,7 @@ class LTX2VideoTransformerBlock(nn.Module):
         )
 
         hidden_states = hidden_states + a2v_gate * a2v_attn_hidden_states
+        del a2v_gate, a2v_attn_hidden_states, video_a2v_ca_scale, video_a2v_ca_shift, audio_a2v_ca_scale, audio_a2v_ca_shift  # Free after use
 
         # Video-to-Audio Cross Attention: Q: Audio; K,V: Video
         mod_norm_hidden_states = norm_hidden_states * (1 + video_v2a_ca_scale.squeeze(2)) + video_v2a_ca_shift.squeeze(
@@ -588,6 +605,7 @@ class LTX2VideoTransformerBlock(nn.Module):
         mod_norm_audio_hidden_states = norm_audio_hidden_states * (
             1 + audio_v2a_ca_scale.squeeze(2)
         ) + audio_v2a_ca_shift.squeeze(2)
+        del video_v2a_ca_scale, video_v2a_ca_shift, audio_v2a_ca_scale, audio_v2a_ca_shift  # Free after use
 
         v2a_attn_hidden_states = self.video_to_audio_attn(
             mod_norm_audio_hidden_states,
@@ -598,11 +616,14 @@ class LTX2VideoTransformerBlock(nn.Module):
         )
 
         audio_hidden_states = audio_hidden_states + v2a_gate * v2a_attn_hidden_states
+        del v2a_gate, v2a_attn_hidden_states  # Free after use
 
         # 4. Feedforward
         norm_hidden_states = self.norm3(hidden_states) * (1 + scale_mlp) + shift_mlp
+        del shift_mlp, scale_mlp  # Free after use
         ff_output = self.ff(norm_hidden_states)
         hidden_states = hidden_states + ff_output * gate_mlp
+        del gate_mlp, ff_output  # Free after use
 
         norm_audio_hidden_states = self.audio_norm3(audio_hidden_states) * (1 + audio_scale_mlp) + audio_shift_mlp
         audio_ff_output = self.audio_ff(norm_audio_hidden_states)
@@ -910,6 +931,7 @@ class LTX2VideoTransformer3DModel(
     _supports_gradient_checkpointing = True
     _skip_layerwise_casting_patterns = ["norm"]
     _repeated_blocks = ["LTX2VideoTransformerBlock"]
+    _no_split_modules = ["LTX2VideoTransformerBlock"]
     _cp_plan = {
         "": {
             "hidden_states": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
@@ -1254,14 +1276,12 @@ class LTX2VideoTransformer3DModel(
             hidden_dtype=hidden_states.dtype,
         )
 
-        # Reshape inverse_indices to [batch, num_tokens] for per-batch indexing
-        # Note: inverse_indices maps each token to its unique timestep index
+        # Keep temb compact as [batch, num_unique, dim] - don't expand to full num_tokens
+        # This saves memory: [batch, 2, dim] instead of [batch, 17856, dim] for img2vid
+        # The blocks will use temb_indices to expand ada_values only when needed
         temb_indices = inverse_indices.view(batch_size, num_total_tokens)
-
-        # Keep temb compact as [batch, num_unique, dim] - DON'T expand to full num_tokens
-        # The blocks will use temb_indices to expand only when needed
         temb = temb_unique.unsqueeze(0).expand(batch_size, -1, -1)  # [batch, num_unique, dim]
-        embedded_timestep = embedded_timestep_unique.unsqueeze(0).expand(batch_size, -1, -1)
+        embedded_timestep = embedded_timestep_unique.unsqueeze(0).expand(batch_size, -1, -1)  # [batch, num_unique, dim]
 
         temb_audio, audio_embedded_timestep = self.audio_time_embed(
             audio_timestep.flatten(),
@@ -1283,14 +1303,10 @@ class LTX2VideoTransformer3DModel(
             batch_size=unique_timesteps.shape[0],
             hidden_dtype=hidden_states.dtype,
         )
-        # Index into unique embeddings
-        video_cross_attn_scale_shift = video_cross_attn_scale_shift_unique[inverse_indices]
-        video_cross_attn_a2v_gate = video_cross_attn_a2v_gate_unique[inverse_indices]
-
-        video_cross_attn_scale_shift = video_cross_attn_scale_shift.view(
-            batch_size, -1, video_cross_attn_scale_shift.shape[-1]
-        )
-        video_cross_attn_a2v_gate = video_cross_attn_a2v_gate.view(batch_size, -1, video_cross_attn_a2v_gate.shape[-1])
+        # Keep cross attention params compact - don't expand to per-token yet
+        # This saves massive memory for img2vid: [batch, num_unique, dim] instead of [batch, num_tokens, dim]
+        video_cross_attn_scale_shift = video_cross_attn_scale_shift_unique.unsqueeze(0).expand(batch_size, -1, -1)
+        video_cross_attn_a2v_gate = video_cross_attn_a2v_gate_unique.unsqueeze(0).expand(batch_size, -1, -1)
 
         audio_cross_attn_scale_shift, _ = self.av_cross_attn_audio_scale_shift(
             audio_timestep.flatten(),
@@ -1335,6 +1351,9 @@ class LTX2VideoTransformer3DModel(
                     audio_cross_attn_rotary_emb,
                     encoder_attention_mask,
                     audio_encoder_attention_mask,
+                    None,  # a2v_cross_attention_mask
+                    None,  # v2a_cross_attention_mask
+                    temb_indices,
                 )
             else:
                 hidden_states, audio_hidden_states = block(
@@ -1354,17 +1373,29 @@ class LTX2VideoTransformer3DModel(
                     ca_audio_rotary_emb=audio_cross_attn_rotary_emb,
                     encoder_attention_mask=encoder_attention_mask,
                     audio_encoder_attention_mask=audio_encoder_attention_mask,
+                    temb_indices=temb_indices,
                 )
 
         # 6. Output layers (including unpatchification)
-        scale_shift_values = self.scale_shift_table[None, None] + embedded_timestep[:, :, None]
+        # embedded_timestep is [batch, num_unique, dim] - expand to [batch, num_tokens, dim] if needed
+        if temb_indices is not None and embedded_timestep.size(1) < num_total_tokens:
+            batch_idx = torch.arange(batch_size, device=embedded_timestep.device)[:, None]
+            embedded_timestep = embedded_timestep[batch_idx, temb_indices]  # [batch, num_tokens, dim]
+
+        # Move scale_shift_table to the same device as hidden_states (for device_map='auto')
+        scale_shift_table = self.scale_shift_table.to(hidden_states.device)
+        embedded_timestep = embedded_timestep.to(hidden_states.device)
+        scale_shift_values = scale_shift_table[None, None] + embedded_timestep[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
         hidden_states = self.norm_out(hidden_states)
         hidden_states = hidden_states * (1 + scale) + shift
         output = self.proj_out(hidden_states)
 
-        audio_scale_shift_values = self.audio_scale_shift_table[None, None] + audio_embedded_timestep[:, :, None]
+        # Move audio_scale_shift_table to the same device as audio_hidden_states
+        audio_scale_shift_table = self.audio_scale_shift_table.to(audio_hidden_states.device)
+        audio_embedded_timestep = audio_embedded_timestep.to(audio_hidden_states.device)
+        audio_scale_shift_values = audio_scale_shift_table[None, None] + audio_embedded_timestep[:, :, None]
         audio_shift, audio_scale = audio_scale_shift_values[:, :, 0], audio_scale_shift_values[:, :, 1]
 
         audio_hidden_states = self.audio_norm_out(audio_hidden_states)

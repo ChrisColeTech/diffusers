@@ -702,16 +702,20 @@ class LTX2ImageToVideoPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraL
                     f" size of {batch_size}. Make sure the batch size matches the length of the generators."
                 )
 
+            # Encode image on VAE device, then move to target device
+            vae_device = next(self.vae.parameters()).device
             init_latents = [
-                retrieve_latents(self.vae.encode(image[i].unsqueeze(0).unsqueeze(2)), generator[i], "argmax")
+                retrieve_latents(self.vae.encode(image[i].unsqueeze(0).unsqueeze(2).to(vae_device)), generator[i], "argmax")
                 for i in range(batch_size)
             ]
         else:
+            # Encode image on VAE device, then move to target device
+            vae_device = next(self.vae.parameters()).device
             init_latents = [
-                retrieve_latents(self.vae.encode(img.unsqueeze(0).unsqueeze(2)), generator, "argmax") for img in image
+                retrieve_latents(self.vae.encode(img.unsqueeze(0).unsqueeze(2).to(vae_device)), generator, "argmax") for img in image
             ]
 
-        init_latents = torch.cat(init_latents, dim=0).to(dtype)
+        init_latents = torch.cat(init_latents, dim=0).to(device=device, dtype=dtype)
         init_latents = self._normalize_latents(init_latents, self.vae.latents_mean, self.vae.latents_std)
         init_latents = init_latents.repeat(1, 1, num_frames, 1, 1)
 
