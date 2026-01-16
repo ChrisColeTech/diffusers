@@ -157,13 +157,17 @@ class LTX2LatentUpsamplePipeline(DiffusionPipeline):
                     f" size of {batch_size}. Make sure the batch size matches the length of the generators."
                 )
 
+            # Encode video on VAE device, then move to target device
+            vae_device = next(self.vae.parameters()).device
             init_latents = [
-                retrieve_latents(self.vae.encode(video[i].unsqueeze(0)), generator[i]) for i in range(batch_size)
+                retrieve_latents(self.vae.encode(video[i].unsqueeze(0).to(vae_device)), generator[i]) for i in range(batch_size)
             ]
         else:
-            init_latents = [retrieve_latents(self.vae.encode(vid.unsqueeze(0)), generator) for vid in video]
+            # Encode video on VAE device, then move to target device
+            vae_device = next(self.vae.parameters()).device
+            init_latents = [retrieve_latents(self.vae.encode(vid.unsqueeze(0).to(vae_device)), generator) for vid in video]
 
-        init_latents = torch.cat(init_latents, dim=0).to(dtype)
+        init_latents = torch.cat(init_latents, dim=0).to(device=device, dtype=dtype)
         # NOTE: latent upsampler operates on the unnormalized latents, so don't normalize here
         # init_latents = self._normalize_latents(init_latents, self.vae.latents_mean, self.vae.latents_std)
         return init_latents
